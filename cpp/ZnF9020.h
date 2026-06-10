@@ -4,7 +4,13 @@
 //   * COMMAND  TCP 6100, UTF-8 CRLF-terminated commands, XML replies.
 //   * STREAM   TCP 6105, 14-byte "Z+F\0" frames; per-line zlib pixel data.
 // Each profile is one vertical-circle revolution; points are emitted as
-//   t  x  y  z  intensity   (y,z = cross-section in metres, x = synthetic travel).
+//   t  x  y  z  intensity   (y,z = cross-section in metres, +Y = -cos, +Z = -sin of mirror angle per Z+F manual, x = synthetic travel).
+// Line layout: pixel_/2 directions; plane0 range (live stream: ~25.7 mm
+// coarse quantisation, wraps every 6.5536 m) + plane2 secondary estimate
+// (noisy, to 13.1 m; "parks" on repeated codes where it fails to measure).
+// Nonius decode (default, cfg.unwrap): wrap count k from plane2 anchors
+// validated by local consensus, continuity chains elsewhere; --no-unwrap
+// folds at 6.55 m without using plane2.
 //
 // The public header pulls in no socket/zlib headers - those stay in the .cpp.
 //
@@ -30,6 +36,11 @@ public:
         std::string resolution = "10000";
         std::string quality    = "50";
         double      min_amp    = 2000.0;     // drop returns below this intensity
+        double      min_range_m = 0.0;        // drop returns closer than this [m]
+        bool        unwrap = true;           // gated >6.55 m unwrap (Z+F-like)
+        double      mixpix_deg = 8.0;        // mixed-pixel edge-trail filter (0=off)
+        double      rotate_deg = 90.8;       // angle-zero/mount correction [deg];
+                                             // calibrated 2026-06-10 (dual-mod decode; orientation user-verified)
         double      spacing    = 0.0;        // synthetic travel per profile for X
         int         print_every = 2048;      // print every Nth pixel of a profile
         bool        has_rps = false, has_mhz = false;

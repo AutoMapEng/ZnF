@@ -36,6 +36,12 @@ def main():
     ap.add_argument("--mhz", type=float, default=None, help="laser data rate [MHz]")
     ap.add_argument("--min-amplitude", type=float, default=2000.0,
                     help="drop returns below this intensity (default 2000)")
+    ap.add_argument("--rotate-deg", type=float, default=None,
+                    help="angle-zero/mount correction [deg] (default: calibrated 90.8)")
+    ap.add_argument("--min-range", type=float, default=0.0,
+                    help="drop returns closer than this [m] (default 0)")
+    ap.add_argument("--mixpix-deg", type=float, default=None,
+                    help="mixed-pixel filter angle (default: acquire's 8.0; 0=off)")
     ap.add_argument("--decimate", type=int, default=2,
                     help="use every Nth pixel for speed (default 2; 1 = all points)")
     ap.add_argument("--persist", type=int, default=1,
@@ -85,6 +91,7 @@ def main():
         args.ip, seconds=args.seconds, mode=args.mode, resolution=args.resolution,
         quality=args.quality, min_amplitude=args.min_amplitude, decimate=args.decimate,
         rps=args.rps, mhz=args.mhz, local_ip=args.local_ip,
+        rotate_deg=args.rotate_deg, min_range=args.min_range,
         log=lambda m: print(m, file=sys.stderr))
 
     try:

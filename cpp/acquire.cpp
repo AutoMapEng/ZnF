@@ -18,6 +18,10 @@ static void usage() {
         "  --rps V            laser motor speed [rev/s]  -> -speed V\n"
         "  --mhz V            laser data rate  [MHz]     -> -datarate V\n"
         "  --min-amplitude A  drop returns below A (default 2000)\n"
+        "  --rotate-deg D     angle-zero/mount correction (default 90.8, calibrated)\n"
+        "  --min-range M      drop returns closer than M metres (default 0 = keep all)\n"
+        "  --no-unwrap        disable gated >6.55 m unwrapping (cap at 6.55 m)\n"
+        "  --mixpix-deg D     mixed-pixel edge-trail filter angle (default 8, 0=off)\n"
         "  --print-every N    print every Nth pixel per profile (default 2048)\n"
         "  --spacing M        synthetic travel per profile for X (default 0 = stationary)\n"
         "  --file NAME        scan file name (default unique live_<timestamp>)\n"
@@ -41,6 +45,10 @@ static bool parse_args(int argc, char** argv, ZnF9020::Config& a) {
         else if (k == "--rps")          { a.rps = atof(val("--rps")); a.has_rps = true; }
         else if (k == "--mhz")          { a.mhz = atof(val("--mhz")); a.has_mhz = true; }
         else if (k == "--min-amplitude")  a.min_amp    = atof(val("--min-amplitude"));
+        else if (k == "--rotate-deg")     a.rotate_deg = atof(val("--rotate-deg"));
+        else if (k == "--min-range")      a.min_range_m = atof(val("--min-range"));
+        else if (k == "--no-unwrap")      a.unwrap = false;
+        else if (k == "--mixpix-deg")     a.mixpix_deg = atof(val("--mixpix-deg"));
         else if (k == "--print-every")    a.print_every = atoi(val("--print-every"));
         else if (k == "--spacing")        a.spacing    = atof(val("--spacing"));
         else if (k == "--file")           a.file       = val("--file");

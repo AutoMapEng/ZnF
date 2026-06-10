@@ -136,13 +136,18 @@ bool ZnF9020::startScan() {
         if (stream_fd_ < 0) sleep_s(0.5);
     }
     if (stream_fd_ < 0) { fprintf(stderr, "!! could not connect to stream port\n"); return false; }
+    int rcvbuf = 4 * 1024 * 1024;           // absorb GUI/X11 stalls without
+    setsockopt(stream_fd_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     return true;
 }
 
 void ZnF9020::streamFor(double seconds) {
     if (stream_fd_ < 0) return;
     double t_s = 0.0; long line_no = -1;
-    double deadline = now_s() + seconds, last_stat = now_s();
+    bool got_data = false;
+    double deadline = now_s() + seconds + 30.0;  // provisional: allow ~12 s spin-up
+    double last_stat = now_s();
+    fprintf(stderr, "# waiting for scanner spin-up (data-invalid phase) ...\n");
     while (now_s() < deadline && !abort_.load()) {
         uint16_t type;
         FrameRes fr = readFrame(type, payload_);
@@ -166,8 +171,14 @@ void ZnF9020::streamFor(double seconds) {
             }
             if (pixel_ < 0) pixel_ = (int)(n / 8);
             long li = (line_no >= 0) ? line_no : lines_;
-            pts_ += decodeProfile(data, n, t_s, (double)li * cfg_.spacing);
+            long got = decodeProfile(data, n, t_s, (double)li * cfg_.spacing);
+            pts_ += got;
             ++lines_;
+            if (!got_data && got > 0) {
+                got_data = true;
+                deadline = now_s() + seconds;    // --seconds counts from first data
+                fprintf(stderr, "# first valid data - %.0f s acquisition window starts\n", seconds);
+            }
         }
         if (now_s() - last_stat >= 1.0) {
             fprintf(stderr, "# ... %ld lines, %ld points\n", lines_, pts_);
@@ -228,37 +239,220 @@ ZnF9020::FrameRes ZnF9020::readFrame(uint16_t& type, std::vector<unsigned char>&
 
 long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, double x) const {
     const uint16_t* u = (const uint16_t*)data;       // host is LE
-    if (pixel_ <= 0 || n < (size_t)pixel_ * 4) return 0;
-    const uint16_t* rng = u;                          // ch0 = range
-    const uint16_t* amp = u + pixel_;                 // ch1 = amplitude
-    int every = cfg_.print_every > 0 ? cfg_.print_every : 1;
-    long cnt = 0;
-    if (on_profile_) {                                // callback sink (e.g. plotter)
-        std::vector<float> ys, zs, is;
-        for (int i = 0; i < pixel_; i += every) {
-            double a = amp[i], rv = rng[i];
-            if (a > cfg_.min_amp && rv > 0.0) {
-                double ang = 2.0 * M_PI * (double)i / (double)pixel_;
-                double r = rv * RANGE_SCALE_M;
-                ys.push_back((float)(r * std::cos(ang)));
-                zs.push_back((float)(r * std::sin(ang)));
-                is.push_back((float)a);
-                ++cnt;
+    if (pixel_ <= 0 || n < (size_t)pixel_ * 8) return 0;
+    // Layout: pixel_/2 directions. plane0[half+j] is the range channel; in the
+    // live tcpzip stream it is COARSE-quantised (~25.7 mm: high byte duplicated
+    // into the low byte) and wraps every 6.5536 m. plane1[half+j] = amplitude.
+    // plane2[j] (x0.2 mm, caps 13.1 m) is an independent noisy (+/-0.3 m)
+    // estimate that resolves the wrap count k - but on weak/grazing returns it
+    // "parks" on repeated code values instead of measuring (a parked plane2
+    // exactly repeats its raw value across neighbours; a real one jitters).
+    // Nonius decode (cf. SDK Nonius/noniusjump): k from plane2 where it
+    // measures (anchors, validated by local k-consensus), k by continuity
+    // along the profile elsewhere (chains grown from the anchors).
+    // No-return STATUS pixels have the duplicated-byte code in plane0 AND
+    // plane2 == the same raw value.
+    static constexpr double AMBIG_M     = 6.5536;
+    static constexpr double SENTINEL_M  = 0.345;  // window/no-return zone
+    static constexpr double SEC_MIN_M   = 0.40;   // plane2 below this = code
+    static constexpr double SEC_TOL_M   = 1.2;    // anchor: |plane2 - r| limit
+    static constexpr int    PARKED_NB   = 4;      // +/- neighbours checked
+    static constexpr int    PARKED_MIN  = 3;      // exact repeats => parked
+    static constexpr int    CONS_WIN    = 16;     // consensus window [px]
+    static constexpr int    CONS_MIN    = 3;      // min anchors in window
+    static constexpr double CONS_FRAC   = 0.6;    // same-k fraction required
+    static constexpr int    GAP_STRICT  = 24;     // plain chain max gap [px]
+    static constexpr int    GAP_BRIDGE  = 96;     // validated-bridge max gap
+    static constexpr int    BRIDGE_MIN  = 12;     // px to validate a bridge
+    static constexpr int    BRIDGE_DIV  = 4;      // distinct raws to validate
+    static constexpr double CHAIN_TOL_M = 1.5;    // chain tolerance cap
+    static constexpr double SLOPE_MAX   = 0.35;   // chain slope cap [m/px]
+    const int dirs = pixel_ / 2;
+    const uint16_t* pf = u + dirs;
+    const uint16_t* pa = u + pixel_ + dirs;
+    const uint16_t* pc = u + 2 * pixel_;
+    const double rot = cfg_.rotate_deg * M_PI / 180.0;
+    auto dup = [](uint16_t v) { return (v & 0xFF) == (v >> 8); };
+
+    // pass 1: per-pixel decode, plane2-anchor selection
+    std::vector<double> rbuf(dirs, 0.0), abuf(dirs, 0.0), fine(dirs), sec(dirs);
+    std::vector<unsigned char> real(dirs, 0), anch(dirs, 0);
+    std::vector<signed char>   ksec(dirs, 0);
+    for (int j = 0; j < dirs; ++j) {
+        abuf[j] = pa[j];
+        fine[j] = pf[j] * RANGE_SCALE_M;
+        sec[j]  = pc[j] * 2.0 * RANGE_SCALE_M;
+        if (dup(pf[j]) && pc[j] == pf[j]) continue;  // no-return status pixel
+        if (abuf[j] <= cfg_.min_amp) continue;
+        real[j] = 1;
+    }
+    if (!cfg_.unwrap) {                              // fold at 6.55 m, no plane2
+        for (int j = 0; j < dirs; ++j)
+            if (real[j] && fine[j] >= SENTINEL_M) rbuf[j] = fine[j];
+    } else {
+        std::vector<int> ai; ai.reserve(dirs / 2);
+        for (int j = 0; j < dirs; ++j) {
+            if (!real[j]) continue;
+            int parked = 0;                          // exact plane2 repeats
+            for (int o = -PARKED_NB; o <= PARKED_NB; ++o) {
+                if (!o) continue;
+                if (pc[(j + o + dirs) % dirs] == pc[j]) ++parked;
+            }
+            if (parked >= PARKED_MIN || sec[j] < SEC_MIN_M) continue;
+            double kk = std::round((sec[j] - fine[j]) / AMBIG_M);
+            if (kk < 0) kk = 0; else if (kk > 2) kk = 2;
+            double r = fine[j] + kk * AMBIG_M;
+            if (std::fabs(sec[j] - r) > SEC_TOL_M) continue;
+            if (kk == 0 && fine[j] < SENTINEL_M) continue;
+            ksec[j] = (signed char)kk;
+            anch[j] = 1; ai.push_back(j);
+        }
+        // consensus: an anchor seeds chains only if its k agrees with the
+        // neighbourhood (lone garbage anchors would seed fold ghosts)
+        const int na = (int)ai.size();
+        for (int t = 0, lo = 0, hi = 0; t < na; ++t) {
+            while (lo < na && ai[lo] < ai[t] - CONS_WIN) ++lo;
+            while (hi < na && ai[hi] <= ai[t] + CONS_WIN) ++hi;
+            int same = 0;
+            for (int q = lo; q < hi; ++q) if (ksec[ai[q]] == ksec[ai[t]]) ++same;
+            if (hi - lo >= CONS_MIN && (double)same >= CONS_FRAC * (hi - lo))
+                rbuf[ai[t]] = fine[ai[t]] + ksec[ai[t]] * AMBIG_M;
+        }
+        // continuity chains (both sweep directions): resolve k for pixels whose
+        // plane2 parked, by predicting r from the running surface; long gaps
+        // are bridged only when a whole run validates (length + raw diversity)
+        struct Pend { int j; double r; uint16_t fraw; unsigned char isAnchor; };
+        std::vector<Pend> pend; pend.reserve(GAP_BRIDGE);
+        for (int sweep = 0; sweep < 2; ++sweep) {
+            long last_j = -(1L << 30), prev_j = -(1L << 30);
+            double last_r = 0.0, prev_r = 0.0;
+            bool bridging = false; pend.clear();
+            for (int t = 0; t < dirs; ++t) {
+                int i = sweep ? dirs - 1 - t : t;
+                if (rbuf[i] > 0.0) {
+                    if (bridging) { pend.clear(); bridging = false; }
+                    prev_j = last_j; prev_r = last_r; last_j = i; last_r = rbuf[i];
+                    continue;
+                }
+                if (!real[i]) continue;
+                long gap = std::labs(i - last_j);
+                if (gap > GAP_BRIDGE) continue;
+                double slope = 0.0;
+                long dj = last_j - prev_j;
+                if (dj != 0 && std::labs(dj) <= 4) {
+                    slope = (last_r - prev_r) / (double)dj;
+                    if (slope > SLOPE_MAX) slope = SLOPE_MAX;
+                    if (slope < -SLOPE_MAX) slope = -SLOPE_MAX;
+                }
+                double pred = last_r + slope * (double)(i - last_j);
+                double kk = std::round((pred - fine[i]) / AMBIG_M);
+                if (kk < 0) kk = 0; else if (kk > 2) kk = 2;
+                double cand = fine[i] + kk * AMBIG_M;
+                double tol = 0.25 + 0.05 * (double)gap;
+                if (tol > CHAIN_TOL_M) tol = CHAIN_TOL_M;
+                if (std::fabs(cand - pred) <= tol &&
+                    !(kk == 0 && fine[i] < SENTINEL_M)) {
+                    if (gap > GAP_STRICT && !bridging) {
+                        bridging = true; pend.clear();
+                        pend.push_back({i, cand, pf[i], anch[i]});
+                    } else if (bridging) {
+                        pend.push_back({i, cand, pf[i], anch[i]});
+                        if ((int)pend.size() >= BRIDGE_MIN) {
+                            int div = 0; bool hasA = false;
+                            for (size_t q = 0; q < pend.size(); ++q) {
+                                hasA = hasA || pend[q].isAnchor;
+                                bool seen = false;
+                                for (size_t w = 0; w < q; ++w)
+                                    if (pend[w].fraw == pend[q].fraw) { seen = true; break; }
+                                if (!seen) ++div;
+                            }
+                            if (div >= BRIDGE_DIV || hasA) {
+                                for (const Pend& pd : pend) rbuf[pd.j] = pd.r;
+                                pend.clear(); bridging = false;
+                            }
+                        }
+                    } else {
+                        rbuf[i] = cand;
+                    }
+                    prev_j = last_j; prev_r = last_r; last_j = i; last_r = cand;
+                } else if (bridging) {
+                    pend.clear(); bridging = false;
+                    last_j = -(1L << 30);            // restart from next seed
+                }
             }
         }
-        if (cnt) on_profile_(t_s, ys, zs, is);
-        return cnt;
     }
-    for (int i = 0; i < pixel_; i += every) {         // default sink: stdout
-        double a = amp[i], rv = rng[i];
-        if (a > cfg_.min_amp && rv > 0.0) {
-            double ang = 2.0 * M_PI * (double)i / (double)pixel_;
-            double r = rv * RANGE_SCALE_M;
-            printf("%9.3f %9.3f %9.3f %9.3f %9.0f\n",
-                   t_s, x, r * std::cos(ang), r * std::sin(ang), a);
-            ++cnt;
+    std::vector<unsigned char> ok(dirs, 0);
+    for (int j = 0; j < dirs; ++j) {
+        if (rbuf[j] <= 0.0) continue;
+        if (rbuf[j] > 200.0) continue;               // spec max-range guard
+        if (rbuf[j] < cfg_.min_range_m) continue;
+        ok[j] = 1;
+    }
+
+    // pass 2: mixed-pixel (edge-trail) filter - drop points whose local chord
+    // is nearly parallel to the beam, EXCEPT long runs of such points (a real
+    // surface seen at grazing incidence, e.g. the far floor, is also chord-
+    // radial but spans far more pixels than a spot-size-bounded edge trail).
+    std::vector<unsigned char> drop(dirs, 0);
+    if (cfg_.mixpix_deg > 0.0) {
+        static constexpr int MIX_RUN_EXEMPT = 32;    // px span = real surface
+        static constexpr int MIX_RUN_GAP    = 8;     // px joining run members
+        const int W = 4;
+        const double cosT = std::cos(cfg_.mixpix_deg * M_PI / 180.0);
+        std::vector<unsigned char> flag(dirs, 0);
+        for (int j = W; j < dirs - W; ++j) {
+            if (!ok[j] || !ok[j - W] || !ok[j + W]) continue;
+            double a0 = 2.0 * M_PI * (j - W) / dirs + rot;
+            double a1 = 2.0 * M_PI * (j + W) / dirs + rot;
+            double cyv = (-rbuf[j + W] * std::cos(a1)) - (-rbuf[j - W] * std::cos(a0));
+            double czv = (-rbuf[j + W] * std::sin(a1)) - (-rbuf[j - W] * std::sin(a0));
+            double cn = std::hypot(cyv, czv);
+            if (cn < 1e-9) continue;
+            double aj = 2.0 * M_PI * j / dirs + rot;
+            double dotv = std::fabs(cyv * (-std::cos(aj)) + czv * (-std::sin(aj)));
+            if (dotv / cn > cosT) flag[j] = 1;       // chord within mixpix_deg
+        }
+        int run_first = -1, run_last = -1;
+        std::vector<int> run; run.reserve(64);
+        auto closeRun = [&]() {
+            if (run_first >= 0 && run_last - run_first < MIX_RUN_EXEMPT)
+                for (int q : run) drop[q] = 1;       // short run = edge trail
+            run.clear(); run_first = run_last = -1;
+        };
+        for (int j = 0; j < dirs; ++j) {
+            if (!flag[j]) continue;
+            if (run_first >= 0 && j - run_last > MIX_RUN_GAP) closeRun();
+            if (run_first < 0) run_first = j;
+            run_last = j; run.push_back(j);
+        }
+        closeRun();
+        const std::vector<unsigned char> drop0(drop); // snapshot: single dilation
+        for (int j = 0; j < dirs; ++j) {             // enlarge pass
+            if (!ok[j] || drop0[j]) continue;
+            int nb = 0;
+            for (int o : {-2, -1, 1, 2})
+                if (j + o >= 0 && j + o < dirs && drop0[j + o]) ++nb;
+            if (nb >= 2) drop[j] = 2;
         }
     }
+
+    // pass 3: emit with stride
+    int every = cfg_.print_every > 0 ? cfg_.print_every : 1;
+    long cnt = 0;
+    std::vector<float> ys, zs, is;
+    for (int j = 0; j < dirs; j += every) {
+        if (!ok[j] || drop[j]) continue;
+        double ang = 2.0 * M_PI * (double)j / (double)dirs + rot;
+        double yy = -rbuf[j] * std::cos(ang), zz = -rbuf[j] * std::sin(ang);
+        if (on_profile_) {
+            ys.push_back((float)yy); zs.push_back((float)zz); is.push_back((float)abuf[j]);
+        } else {
+            printf("%9.3f %9.3f %9.3f %9.3f %9.0f\n", t_s, x, yy, zz, abuf[j]);
+        }
+        ++cnt;
+    }
+    if (on_profile_ && cnt) on_profile_(t_s, ys, zs, is);
     return cnt;
 }
 

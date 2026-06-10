@@ -34,7 +34,7 @@ Decoding reuses the validated .zfs logic (see zfs2ply.py): each streamed line is
 one full vertical-circle revolution; for pixel i of a line:
     vertical angle a = 2*pi * i / pixel
     range  r = ch0 * 0.0001 m            (1/10 mm raw unit, per SDK)
-    cross-section  Y = r*cos a ,  Z = r*sin a   ;  X = line * spacing (synthetic; 0=stationary)
+    cross-section  Y = -r*cos a , Z = -r*sin a  ;  X = line * spacing (synthetic; 0=stationary)
     intensity = ch1 ;  t = line-header time [ms] / 1000
 
 -------------------------------------------------------------------------------
@@ -47,6 +47,7 @@ calibrated XYZ, link libzfs.so and call ZFLineByLine::XYZ() instead.
 """
 import sys
 import re
+import math
 import socket
 import time
 import zlib
@@ -70,213 +71,142 @@ LH_TIME, LH_LINENUMBER = 7, 8
 
 RANGE_SCALE_M = 0.0001       # 1/10 mm raw range unit (Z+F SDK)
 
-# Scan-command flags for motor speed / laser data-rate. These are parsed by the
-# DEVICE firmware (not exposed in the SDK headers, so the names are inferred).
-# If the scan reply shows an error, fix the token here or use --extra / --scan-args.
+# Scan-command flags for motor speed / laser data-rate (device-firmware side;
+# names inferred - override via --extra / --scan-args if rejected).
 RPS_FLAG = "-speed"          # laser motor speed   [rev/s]
 MHZ_FLAG = "-datarate"       # laser data rate     [MHz]
+ROTATE_DEG = 90.8            # angle-zero/mount correction [deg]; calibrated 2026-06-10 (orientation user-verified)
 
-# device status bits (lrcctrl_if.h STATUS_*)
-STATUS_BITS = [
-    (1 << 0, "ID"), (1 << 1, "STREAMING"), (1 << 2, "SCANNING"), (1 << 3, "ERROR"),
-    (1 << 4, "WRITING"), (1 << 5, "PIN-PROTECTED"), (1 << 6, "LOCKED/LOGIN"),
-    (1 << 7, "OUT-OF-SPACE"), (1 << 8, "NOT-READY/BOOTING"), (1 << 9, "BATCH"),
-    (1 << 10, "PAUSE"), (1 << 11, "DATA-INVALID"), (1 << 14, "POST-PROC"),
-    (1 << 15, "STARTUP"), (1 << 16, "USER-ABORT"),
-]
+SENTINEL_MIN_R = 0.345       # device min-range sentinel (~0.334 m) marks no-return
+AMBIG_M = 6.5536             # fine-range ambiguity interval [m]
+MIXPIX_DEG = 8.0             # mixed-pixel filter: drop points whose local chord
+                             # is within this angle of the beam (edge trails)
 
 
-def decode_status(v):
-    on = [name for bit, name in STATUS_BITS if v & bit]
-    return f"0x{v:x} [{', '.join(on) if on else 'none'}]"
+def mixpix_mask(r, valid, rot_rad, deg=MIXPIX_DEG, W=4):
+    """Mixed-pixel (edge-trail) filter, SDK-style: phase scanners bridge depth
+    edges with radial point trails. Drop valid points whose local surface chord
+    lies within `deg` degrees of the beam direction - EXCEPT long runs of such
+    points (a real surface at grazing incidence, e.g. the far floor, is also
+    chord-radial but spans far more pixels than a spot-size-bounded edge
+    trail). Then one 'enlarge' pass drops survivors with >=2 dropped
+    neighbours within +/-2. Returns keep mask. Matches cpp/ZnF9020.cpp."""
+    if deg <= 0:
+        return valid
+    MIX_RUN_EXEMPT, MIX_RUN_GAP = 32, 8
+    n = r.size
+    aa = 2.0 * np.pi * np.arange(n) / n + rot_rad
+    py = -r * np.cos(aa); pz = -r * np.sin(aa)
+    keep = valid.copy()
+    cy = py[2*W:] - py[:-2*W]; cz = pz[2*W:] - pz[:-2*W]
+    cn = np.hypot(cy, cz)
+    dot = np.abs(cy * (-np.cos(aa[W:-W])) + cz * (-np.sin(aa[W:-W])))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        g = np.degrees(np.arccos(np.clip(dot / np.where(cn > 1e-9, cn, np.inf), 0, 1)))
+    ok = valid[W:-W] & valid[2*W:] & valid[:-2*W]
+    flag = np.zeros(n, bool)
+    flag[W:-W] = ok & (g < deg)
+    drop = np.zeros(n, bool)
+    fi = np.nonzero(flag)[0]
+    if fi.size:                                # short runs only = edge trails
+        cuts = np.nonzero(np.diff(fi) > MIX_RUN_GAP)[0] + 1
+        for grp in np.split(fi, cuts):
+            if grp[-1] - grp[0] < MIX_RUN_EXEMPT:
+                drop[grp] = True
+    nb = np.convolve(drop.astype(np.int8), np.array([1,1,0,1,1],np.int8), mode="same")
+    drop |= valid & (nb >= 2)
+    keep[drop] = False
+    return keep
 
 
-# --------------------------------------------------------------------------- #
-# socket helpers
-# --------------------------------------------------------------------------- #
-def recv_exact(sock, n):
-    """Read exactly n bytes or raise."""
-    parts = []
-    got = 0
-    while got < n:
-        chunk = sock.recv(n - got)
-        if not chunk:
-            raise ConnectionError("stream socket closed by peer")
-        parts.append(chunk)
-        got += len(chunk)
-    return b"".join(parts)
+
+def decode_dual(u, pixel, unwrap=True, prev_sec=None, min_amp=2000.0):
+    """Nonius decode (matches cpp/ZnF9020.cpp decodeProfile exactly).
+    plane0[half+j] is the range channel; the live tcpzip stream quantises it
+    to ~25.7 mm (high byte duplicated into the low byte), wrapping every
+    6.5536 m. plane2[j] (x0.2 mm, caps 13.1 m, +/-0.3 m) is an independent
+    estimate that resolves the wrap count k - but on weak/grazing returns it
+    "parks" on repeated code values instead of measuring (parked = its raw
+    value exactly repeats across neighbours; real measurements jitter).
+    k comes from plane2 where it measures (anchors, validated by local
+    k-consensus) and from continuity along the profile elsewhere (chains
+    grown from the anchors; long gaps bridged only when a run validates).
+    No-return STATUS pixels: duplicated-byte code in plane0 AND plane2 ==
+    the same raw. unwrap=False folds at 6.5536 m without using plane2.
+    prev_sec accepted for API compat (unused).
+    Returns (r_metres, amp, sec); invalid -> r=0."""
+    SEC_MIN_M, SEC_TOL_M = 0.40, 1.2
+    PARKED_NB, PARKED_MIN = 4, 3
+    CONS_WIN, CONS_MIN, CONS_FRAC = 16, 3, 0.6
+    GAP_STRICT, GAP_BRIDGE, BRIDGE_MIN, BRIDGE_DIV = 24, 96, 12, 4
+    CHAIN_TOL_M, SLOPE_MAX = 1.5, 0.35
+    half = pixel // 2
+    fraw = u[half:pixel].astype(np.int64)
+    sraw = u[2 * pixel:2 * pixel + half].astype(np.int64)
+    fine = fraw.astype(np.float64) * RANGE_SCALE_M
+    amp  = u[pixel + half:2 * pixel].astype(np.float64)
+    sec  = sraw.astype(np.float64) * 2 * RANGE_SCALE_M
+    code = ((fraw & 0xFF) == (fraw >> 8)) & (sraw == fraw)   # no-return status
+    real = (~code) & (amp > min_amp)
+    if not unwrap:                            # fold at 6.55 m, no plane2 use
+        r = np.where(real & (fine >= SENTINEL_MIN_R), fine, 0.0)
+        r[r > 200.0] = 0.0
+        return r, amp, sec
+    parked = np.zeros(half, dtype=np.int64)   # exact plane2 repeats (circular)
+    for off in (-4, -3, -2, -1, 1, 2, 3, 4):
+        parked += (sraw == np.roll(sraw, off))
+    k = np.floor((sec - fine) / AMBIG_M + 0.5)          # round-half-up = C++
+    np.clip(k, 0, 2, out=k)
+    ra = fine + k * AMBIG_M
+    anchor = (real & (parked < PARKED_MIN) & (sec >= SEC_MIN_M)
+              & (np.abs(sec - ra) <= SEC_TOL_M) & ~((k == 0) & (fine < SENTINEL_MIN_R)))
+    ai = np.nonzero(anchor)[0]
+    r = np.zeros(half)
+    ak = k[ai].astype(np.int64)
+    lo = np.searchsorted(ai, ai - CONS_WIN); hi = np.searchsorted(ai, ai + CONS_WIN + 1)
+    for t in range(len(ai)):                  # consensus: lone anchors don't seed
+        votes = ak[lo[t]:hi[t]]
+        if len(votes) >= CONS_MIN and (votes == ak[t]).mean() >= CONS_FRAC:
+            r[ai[t]] = ra[ai[t]]
+    for sweep in (range(half), range(half - 1, -1, -1)):   # continuity chains
+        pend = []                              # (j, cand, fraw, is_anchor)
+        last_j = -(1 << 30); last_r = 0.0; prev_j = -(1 << 30); prev_r = 0.0
+        bridging = False
+        for i in sweep:
+            if r[i] > 0.0:
+                if bridging: pend = []; bridging = False
+                prev_j, prev_r = last_j, last_r; last_j, last_r = i, r[i]; continue
+            if not real[i]: continue
+            gap = abs(i - last_j)
+            if gap > GAP_BRIDGE: continue
+            slope = 0.0
+            dj = last_j - prev_j
+            if dj != 0 and abs(dj) <= 4:
+                slope = max(-SLOPE_MAX, min(SLOPE_MAX, (last_r - prev_r) / dj))
+            pred = last_r + slope * (i - last_j)
+            kk = min(2.0, max(0.0, math.floor((pred - fine[i]) / AMBIG_M + 0.5)))
+            cand = fine[i] + kk * AMBIG_M
+            tol = min(0.25 + 0.05 * gap, CHAIN_TOL_M)
+            if abs(cand - pred) <= tol and not (kk == 0 and fine[i] < SENTINEL_MIN_R):
+                if gap > GAP_STRICT and not bridging:
+                    bridging = True; pend = [(i, cand, fraw[i], bool(anchor[i]))]
+                elif bridging:
+                    pend.append((i, cand, fraw[i], bool(anchor[i])))
+                    if len(pend) >= BRIDGE_MIN:
+                        if (len(set(p[2] for p in pend)) >= BRIDGE_DIV
+                                or any(p[3] for p in pend)):
+                            for q, rv, _, _ in pend: r[q] = rv
+                            pend = []; bridging = False
+                else:
+                    r[i] = cand
+                prev_j, prev_r = last_j, last_r; last_j, last_r = i, cand
+            elif bridging:
+                pend = []; bridging = False
+                last_j = -(1 << 30)            # restart from next seed
+    r[r > 200.0] = 0.0                         # spec max range guard
+    return r, amp, sec
 
 
-def read_frame(sock):
-    """Resync to the 'Z+F\\0' marker, read the 14-byte header + payload.
-    Returns (payload_type, elems, payload_bytes)."""
-    window = recv_exact(sock, 4)
-    while window != MARKER:                       # byte-wise resync
-        window = window[1:] + recv_exact(sock, 1)
-    hdr = recv_exact(sock, 10)
-    ptype, size, elems = struct.unpack("<HII", hdr)
-    payload = recv_exact(sock, size) if size else b""
-    return ptype, elems, payload
-
-
-def send_cmd(cmd_sock, text, wait=2.5):
-    """Send a UTF-8 command (CRLF-terminated - confirmed against the device) and
-    return the reply. Returns as soon as a complete XML reply (</xml>) arrives,
-    otherwise after `wait` seconds."""
-    cmd_sock.sendall(text.encode("utf-8") + b"\r\n")
-    cmd_sock.settimeout(wait)
-    reply = b""
-    try:
-        while True:
-            chunk = cmd_sock.recv(4096)
-            if not chunk:
-                break
-            reply += chunk
-            if b"</xml>" in reply:           # full reply received -> return now
-                break
-    except socket.timeout:
-        pass
-    return reply.decode("utf-8", "replace").strip()
-
-
-def status_int(xml_reply):
-    """Extract the integer from a <status>N</status> reply (or a bare int)."""
-    m = re.search(r"<status>(-?\d+)</status>", xml_reply)
-    if m:
-        return int(m.group(1))
-    s = xml_reply.strip()
-    return int(s) if s.lstrip("-").isdigit() else None
-
-
-def affirmative_action(xml_reply):
-    """First action keyword of a messagebox act="yes,no" (-> 'yes')."""
-    m = re.search(r'act="([^"]*)"', xml_reply)
-    return m.group(1).split(",")[0].strip() if m and m.group(1) else "yes"
-
-
-def report(cmd_sock, label, command, wait):
-    """Send a command and print the reply, decoding the status word if present."""
-    r = send_cmd(cmd_sock, command, wait)
-    s = status_int(r)
-    extra = "  " + decode_status(s) if s is not None else ""
-    print(f"# {label}: {r!r}{extra}")
-    return r
-
-
-def ensure_idle(cmd_sock, wait, tries=12):
-    """Bring the device to an idle, ready state: auto-answer any pending
-    messagebox (e.g. a leftover 'Overwrite?' box) and stop any running/stuck
-    scan from a previous run. Returns the final status reply."""
-    BUSY = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 15)   # STREAMING|SCANNING|ERROR|STARTUP
-    last = ""
-    for _ in range(tries):
-        last = send_cmd(cmd_sock, "status", wait)
-        if "<messagebox" in last:
-            send_cmd(cmd_sock, affirmative_action(last), wait)
-            time.sleep(0.3)
-            continue
-        s = status_int(last)
-        if s is not None and (s & BUSY):
-            send_cmd(cmd_sock, "stop", wait)
-            time.sleep(0.5)
-            continue
-        break
-    s = status_int(last)
-    print(f"# status (idle): {last!r}" + (f"  {decode_status(s)}" if s is not None else ""))
-    return last
-
-
-def local_ip_towards(target_ip):
-    """Best-effort local IP that routes to the scanner (for -ip)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect((target_ip, PORT_COMMAND))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
-
-
-def connect_command(ip, timeout=5):
-    """Connect to the scanner command port (6100) with a clear error on failure."""
-    try:
-        return socket.create_connection((ip, PORT_COMMAND), timeout=timeout)
-    except OSError as e:
-        note = ""
-        if local_ip_towards(ip) == ip:
-            note = ("\n   That address is THIS PC's own IP. In a Z+F scan command the '-ip'"
-                    "\n   value is the PC/client address (where the scanner streams TO), not the"
-                    "\n   scanner's address. Use the scanner's own IP (its web-UI address), or"
-                    "\n   run:  python3 acquire.py --find   to discover it on the subnet.")
-        sys.exit(f"!! cannot reach scanner command port {ip}:{PORT_COMMAND}  ({e}){note}")
-
-
-def find_scanners(local_ip, port=PORT_COMMAND, timeout=0.3):
-    """Scan the local /24 for hosts whose command port is open (candidate scanners)."""
-    import concurrent.futures
-    base = ".".join(local_ip.split(".")[:3])
-
-    def probe(i):
-        ip = f"{base}.{i}"
-        try:
-            socket.create_connection((ip, port), timeout=timeout).close()
-            return ip
-        except OSError:
-            return None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=128) as ex:
-        return [r for r in ex.map(probe, range(1, 255)) if r]
-
-
-def raw_probe(ip):
-    """Low-level command-channel diagnosis: read any connect banner, then try
-    each line terminator and dump the raw bytes the device sends back."""
-    for term, name in ((b"\r\n", "CRLF"), (b"\n", "LF"), (b"\r", "CR")):
-        print(f"\n# --- attempt: 'version' + {name} ---")
-        s = connect_command(ip)
-        s.settimeout(1.5)
-        banner = b""
-        try:
-            while True:
-                c = s.recv(4096)
-                if not c:
-                    break
-                banner += c
-        except socket.timeout:
-            pass
-        print(f"#   banner on connect: {banner[:200]!r}" if banner else "#   banner on connect: <none>")
-        try:
-            s.sendall(b"version" + term)
-        except OSError as e:
-            print(f"#   send failed: {e}")
-            s.close()
-            continue
-        s.settimeout(3.0)
-        rep, closed = b"", False
-        try:
-            while True:
-                c = s.recv(4096)
-                if not c:
-                    closed = True
-                    break
-                rep += c
-        except socket.timeout:
-            pass
-        state = " (device closed connection)" if closed else " (silent / timeout)"
-        print(f"#   reply: {len(rep)} bytes{state if not rep else ''}: {rep[:300]!r}")
-        s.close()
-        if rep:
-            print(f"#   >>> {name} elicited a reply - use this terminator.")
-            return
-    print("\n# No terminator produced a reply. Most likely another client holds the")
-    print("# command port (close the scanner's web UI / LaserControl and retry), or")
-    print("# the device closed the socket (see above) and needs login/PIN first.")
-
-
-# --------------------------------------------------------------------------- #
-# decoding
-# --------------------------------------------------------------------------- #
 def parse_zfs_header_pixel(buf):
     """Walk the TLV header just enough to find pixel-per-line (idx 2)."""
     pos = 8
@@ -312,16 +242,18 @@ def lineheader_number(lh):
     return -1
 
 
-def decode_line(pixdata, pixel, line_idx, t_s, spacing, min_amp, every):
+def decode_line(pixdata, pixel, line_idx, t_s, spacing, min_amp, every, rot_deg=None, min_range=0.0, unwrap=True, mixpix_deg=MIXPIX_DEG, prev_sec=None):
     """Decompressed pixel block -> list of (t,x,y,z,intensity) for kept points.
     Planar channels: ch0=range, ch1=intensity (validated against .zfs)."""
     u = np.frombuffer(pixdata, dtype="<u2")
-    if pixel <= 0 or u.size < 2 * pixel:
+    if pixel <= 0 or u.size < 4 * pixel:
         return []
-    rng = u[0:pixel].astype(np.float64)
-    amp = u[pixel:2 * pixel].astype(np.float64)
+    r_m, amp, _sec = decode_dual(u, pixel, unwrap=unwrap, prev_sec=prev_sec, min_amp=min_amp)
+    pixel = pixel // 2                        # directions per revolution
     i = np.arange(pixel)
-    keep = (amp > min_amp) & (rng > 0)
+    keep = (amp > min_amp) & (r_m > 0) & (r_m >= min_range)
+    keep = mixpix_mask(r_m, keep, np.radians(ROTATE_DEG if rot_deg is None else rot_deg),
+                       deg=mixpix_deg)
     if every > 1:
         sel = np.zeros(pixel, bool)
         sel[::every] = True
@@ -329,25 +261,27 @@ def decode_line(pixdata, pixel, line_idx, t_s, spacing, min_amp, every):
     idx = np.nonzero(keep)[0]
     if idx.size == 0:
         return []
-    a = 2.0 * np.pi * idx / pixel
-    r = rng[idx] * RANGE_SCALE_M
-    y = r * np.cos(a)
-    z = r * np.sin(a)
+    a = 2.0 * np.pi * idx / pixel + np.radians(ROTATE_DEG if rot_deg is None else rot_deg)
+    r = r_m[idx]
+    y = -r * np.cos(a)          # Z+F manual frame (x fwd, y left, z up): +Y = -cos
+    z = -r * np.sin(a)          # +Z = -sin
     x = float(line_idx) * spacing            # synthetic travel; 0 (default) = stationary
     return [(t_s, x, float(yy), float(zz), float(aa))
             for yy, zz, aa in zip(y, z, amp[idx])]
 
 
-def decode_profile_yz(pixdata, pixel, min_amp, decimate=1):
+def decode_profile_yz(pixdata, pixel, min_amp, decimate=1, rot_deg=None, min_range=0.0, unwrap=True, mixpix_deg=MIXPIX_DEG, prev_sec=None):
     """One profile's pixel data -> (y, z, intensity) numpy arrays (cross-section,
     metres). Same model as decode_line but returns arrays for plotting."""
     u = np.frombuffer(pixdata, dtype="<u2")
     empty = (np.empty(0), np.empty(0), np.empty(0))
-    if pixel <= 0 or u.size < 2 * pixel:
+    if pixel <= 0 or u.size < 4 * pixel:
         return empty
-    rng = u[0:pixel].astype(np.float64)
-    amp = u[pixel:2 * pixel].astype(np.float64)
-    keep = (amp > min_amp) & (rng > 0)
+    r_m, amp, _sec = decode_dual(u, pixel, unwrap=unwrap, prev_sec=prev_sec, min_amp=min_amp)
+    pixel = pixel // 2                        # directions per revolution
+    keep = (amp > min_amp) & (r_m > 0) & (r_m >= min_range)
+    keep = mixpix_mask(r_m, keep, np.radians(ROTATE_DEG if rot_deg is None else rot_deg),
+                       deg=mixpix_deg)
     if decimate > 1:
         sel = np.zeros(pixel, bool)
         sel[::decimate] = True
@@ -355,14 +289,192 @@ def decode_profile_yz(pixdata, pixel, min_amp, decimate=1):
     idx = np.nonzero(keep)[0]
     if idx.size == 0:
         return empty
-    a = 2.0 * np.pi * idx / pixel
-    r = rng[idx] * RANGE_SCALE_M
-    return (r * np.cos(a), r * np.sin(a), amp[idx])
+    a = 2.0 * np.pi * idx / pixel + np.radians(ROTATE_DEG if rot_deg is None else rot_deg)
+    r = r_m[idx]
+    return (-r * np.cos(a), -r * np.sin(a), amp[idx])  # +Y = -cos, +Z = -sin (manual)
+
+
+# device status bits (lrcctrl_if.h STATUS_*)
+STATUS_BITS = [
+    (1 << 0, "ID"), (1 << 1, "STREAMING"), (1 << 2, "SCANNING"), (1 << 3, "ERROR"),
+    (1 << 4, "WRITING"), (1 << 5, "PIN-PROTECTED"), (1 << 6, "LOCKED/LOGIN"),
+    (1 << 7, "OUT-OF-SPACE"), (1 << 8, "NOT-READY/BOOTING"), (1 << 9, "BATCH"),
+    (1 << 10, "PAUSE"), (1 << 11, "DATA-INVALID"), (1 << 14, "POST-PROC"),
+    (1 << 15, "STARTUP"), (1 << 16, "USER-ABORT"),
+]
+
+
+def decode_status(v):
+    on = [name for bit, name in STATUS_BITS if v & bit]
+    return f"0x{v:x} [{', '.join(on) if on else 'none'}]"
+
+
+def recv_exact(sock, n):
+    """Read exactly n bytes or raise."""
+    parts = []
+    got = 0
+    while got < n:
+        chunk = sock.recv(n - got)
+        if not chunk:
+            raise ConnectionError("stream socket closed by peer")
+        parts.append(chunk)
+        got += len(chunk)
+    return b"".join(parts)
+
+
+def read_frame(sock):
+    """Resync to the 'Z+F\0' marker, read the 14-byte header + payload."""
+    window = recv_exact(sock, 4)
+    while window != MARKER:
+        window = window[1:] + recv_exact(sock, 1)
+    hdr = recv_exact(sock, 10)
+    ptype, size, elems = struct.unpack("<HII", hdr)
+    payload = recv_exact(sock, size) if size else b""
+    return ptype, elems, payload
+
+
+def send_cmd(cmd_sock, text, wait=2.5):
+    """Send a UTF-8 CRLF-terminated command; return reply (to </xml> or timeout)."""
+    cmd_sock.sendall(text.encode("utf-8") + b"\r\n")
+    cmd_sock.settimeout(wait)
+    reply = b""
+    try:
+        while True:
+            chunk = cmd_sock.recv(4096)
+            if not chunk:
+                break
+            reply += chunk
+            if b"</xml>" in reply:
+                break
+    except socket.timeout:
+        pass
+    return reply.decode("utf-8", "replace").strip()
+
+
+def status_int(xml_reply):
+    m = re.search(r"<status>(-?\d+)</status>", xml_reply)
+    if m:
+        return int(m.group(1))
+    s = xml_reply.strip()
+    return int(s) if s.lstrip("-").isdigit() else None
+
+
+def affirmative_action(xml_reply):
+    m = re.search(r'act="([^"]*)"', xml_reply)
+    return m.group(1).split(",")[0].strip() if m and m.group(1) else "yes"
+
+
+def report(cmd_sock, label, command, wait):
+    r = send_cmd(cmd_sock, command, wait)
+    s = status_int(r)
+    extra = "  " + decode_status(s) if s is not None else ""
+    print(f"# {label}: {r!r}{extra}")
+    return r
+
+
+def ensure_idle(cmd_sock, wait, tries=12):
+    """Answer pending messageboxes / stop running scans until idle."""
+    BUSY = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 15)
+    last = ""
+    for _ in range(tries):
+        last = send_cmd(cmd_sock, "status", wait)
+        if "<messagebox" in last:
+            send_cmd(cmd_sock, affirmative_action(last), wait)
+            time.sleep(0.3)
+            continue
+        s = status_int(last)
+        if s is not None and (s & BUSY):
+            send_cmd(cmd_sock, "stop", wait)
+            time.sleep(0.5)
+            continue
+        break
+    s = status_int(last)
+    print(f"# status (idle): {last!r}" + (f"  {decode_status(s)}" if s is not None else ""))
+    return last
+
+
+def local_ip_towards(target_ip):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((target_ip, PORT_COMMAND))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def connect_command(ip, timeout=5):
+    try:
+        return socket.create_connection((ip, PORT_COMMAND), timeout=timeout)
+    except OSError as e:
+        note = ""
+        if local_ip_towards(ip) == ip:
+            note = ("\n   That address is THIS PC's own IP. Use the scanner's address, or run"
+                    "\n   python3 acquire.py --find to discover it on the subnet.")
+        sys.exit(f"!! cannot reach scanner command port {ip}:{PORT_COMMAND}  ({e}){note}")
+
+
+def find_scanners(local_ip, port=PORT_COMMAND, timeout=0.3):
+    import concurrent.futures
+    base = ".".join(local_ip.split(".")[:3])
+
+    def probe(i):
+        ip = f"{base}.{i}"
+        try:
+            socket.create_connection((ip, port), timeout=timeout).close()
+            return ip
+        except OSError:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=128) as ex:
+        return [r for r in ex.map(probe, range(1, 255)) if r]
+
+
+def raw_probe(ip):
+    """Try CRLF/LF/CR terminators against the command port, dumping raw replies."""
+    for term, name in ((b"\r\n", "CRLF"), (b"\n", "LF"), (b"\r", "CR")):
+        print(f"\n# --- attempt: 'version' + {name} ---")
+        s = connect_command(ip)
+        s.settimeout(1.5)
+        banner = b""
+        try:
+            while True:
+                c = s.recv(4096)
+                if not c:
+                    break
+                banner += c
+        except socket.timeout:
+            pass
+        print(f"#   banner on connect: {banner[:200]!r}" if banner else "#   banner on connect: <none>")
+        try:
+            s.sendall(b"version" + term)
+        except OSError as e:
+            print(f"#   send failed: {e}")
+            s.close()
+            continue
+        s.settimeout(3.0)
+        rep = b""
+        try:
+            while True:
+                c = s.recv(4096)
+                if not c:
+                    break
+                rep += c
+        except socket.timeout:
+            pass
+        print(f"#   reply: {len(rep)} bytes: {rep[:300]!r}")
+        s.close()
+        if rep:
+            print(f"#   >>> {name} elicited a reply - use this terminator.")
+            return
+    print("\n# No terminator produced a reply (port held by another client, or login needed).")
 
 
 def iter_profiles(ip, seconds=30.0, mode="tcpzip", resolution="10000", quality="50",
                   min_amplitude=2000.0, decimate=1, rps=None, mhz=None, scan_args=None,
-                  file=None, extra=None, local_ip=None, reply_wait=2.5, log=print):
+                  file=None, extra=None, local_ip=None, reply_wait=2.5, log=print,
+                  rotate_deg=None, min_range=0.0):
     """Generator: connect, start a profiler scan, and yield (t, y, z, intensity)
     numpy arrays for each profile until the scan stops or `seconds` elapse. Always
     stops the scan and closes the sockets on exit. (y,z metres; intensity raw.)"""
@@ -413,6 +525,7 @@ def iter_profiles(ip, seconds=30.0, mode="tcpzip", resolution="10000", quality="
         stream.settimeout(1.0)
         pixel = None
         cur_lh = b""
+        prev_sec = None
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             try:
@@ -438,7 +551,12 @@ def iter_profiles(ip, seconds=30.0, mode="tcpzip", resolution="10000", quality="
                 if pixel is None:
                     pixel = len(data) // 8
                 t_s = lineheader_time_ms(cur_lh) / 1000.0
-                y, z, inten = decode_profile_yz(data, pixel, min_amplitude, decimate)
+                u_arr = np.frombuffer(data, dtype="<u2")
+                y, z, inten = decode_profile_yz(data, pixel, min_amplitude, decimate,
+                                                rot_deg=rotate_deg, min_range=min_range,
+                                                prev_sec=prev_sec)
+                if u_arr.size >= 4 * pixel:
+                    prev_sec = u_arr[2*pixel:2*pixel + pixel//2].astype(np.float64) * 2 * RANGE_SCALE_M
                 if y.size:
                     yield (t_s, y, z, inten)
     finally:
@@ -500,6 +618,14 @@ def main():
                          "carry, so only set this for a known constant-speed move.")
     ap.add_argument("--min-amplitude", type=float, default=2000.0,
                     help="skip points below this intensity (default 2000)")
+    ap.add_argument("--rotate-deg", type=float, default=None,
+                    help=f"angle-zero/mount correction [deg] (default {ROTATE_DEG}, calibrated)")
+    ap.add_argument("--min-range", type=float, default=0.0,
+                    help="drop returns closer than this [m] (default 0)")
+    ap.add_argument("--no-unwrap", action="store_true",
+                    help="disable gated >6.55 m unwrapping (caps range at 6.55 m)")
+    ap.add_argument("--mixpix-deg", type=float, default=MIXPIX_DEG,
+                    help=f"mixed-pixel edge-trail filter angle (default {MIXPIX_DEG}; 0=off)")
     ap.add_argument("--print-every", type=int, default=2048,
                     help="print every Nth valid pixel per line to keep console readable (default 2048)")
     ap.add_argument("--local-ip", default=None, help="override local IP advertised to scanner")
@@ -604,6 +730,7 @@ def main():
             return 1
 
         print("# t[s]      x[m]      y[m]      z[m]   intensity")
+        prev_sec_main = None
         stream.settimeout(1.0)
         deadline = time.monotonic() + args.seconds
         last_stat = time.monotonic()
@@ -640,9 +767,15 @@ def main():
                     line_idx = lines
                 for (t, x, y, z, inten) in decode_line(
                         data, pixel, line_idx, t_s, args.spacing,
-                        args.min_amplitude, args.print_every):
+                        args.min_amplitude, args.print_every,
+                        rot_deg=args.rotate_deg, min_range=args.min_range,
+                        unwrap=not args.no_unwrap, mixpix_deg=args.mixpix_deg,
+                        prev_sec=prev_sec_main):
                     print(f"{t:9.3f} {x:9.3f} {y:9.3f} {z:9.3f} {inten:9.0f}")
                     pts += 1
+                _u = np.frombuffer(data, dtype="<u2")
+                if _u.size >= 4 * pixel:
+                    prev_sec_main = _u[2*pixel:2*pixel + pixel//2].astype(np.float64) * 2 * RANGE_SCALE_M
                 lines += 1
 
             now = time.monotonic()
