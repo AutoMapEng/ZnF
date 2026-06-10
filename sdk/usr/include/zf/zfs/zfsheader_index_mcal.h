@@ -1,0 +1,146 @@
+#pragma once
+
+
+namespace zfs
+{
+    // mcal
+    enum
+    {
+        ZFSIDX_MCAL_BLOCKSIZE = 15401,
+
+        ZFSIDX_MCAL_START = 15500,
+        ZFSIDX_MCAL_0 = ZFSIDX_MCAL_START,
+        ZFSIDX_MCAL_1,
+        ZFSIDX_MCAL_2,
+        ZFSIDX_MCAL_3,
+        ZFSIDX_MCAL_4,
+        ZFSIDX_MCAL_5,
+        ZFSIDX_MCAL_6,
+        ZFSIDX_MCAL_7,
+        ZFSIDX_MCAL_8,
+        ZFSIDX_MCAL_9,
+        ZFSIDX_MCAL_10,
+        ZFSIDX_MCAL_11,
+        ZFSIDX_MCAL_12,
+        ZFSIDX_MCAL_13,
+        ZFSIDX_MCAL_14,
+        ZFSIDX_MCAL_15,
+        ZFSIDX_MCAL_16,
+        ZFSIDX_MCAL_17,
+        ZFSIDX_MCAL_18,
+        ZFSIDX_MCAL_19,
+        ZFSIDX_MCAL_20,
+        ZFSIDX_MCAL_21,
+        ZFSIDX_MCAL_22,
+        ZFSIDX_MCAL_23,
+        ZFSIDX_MCAL_24,
+        ZFSIDX_MCAL_25,
+        ZFSIDX_MCAL_26,
+        ZFSIDX_MCAL_27,
+        ZFSIDX_MCAL_28,
+        ZFSIDX_MCAL_29,
+        ZFSIDX_MCAL_30,
+        ZFSIDX_MCAL_31
+    };
+
+    // mcaltemp
+    enum
+    {
+        ZFSIDX_MCALTEMP_FLAG = 15550,
+        ZFSIDX_MCALTEMP_TEMP,
+        ZFSIDX_MCALTEMP_TEMP_UG,
+        ZFSIDX_MCALTEMP_TEMP_OG,
+        ZFSIDX_MCALTEMP_POLY_MCALO,
+        ZFSIDX_MCALTEMP_POLY_MCALO_p2,
+        ZFSIDX_MCALTEMP_POLY_MCALO_p3,
+        ZFSIDX_MCALTEMP_POLY_MCALO_p4,
+        ZFSIDX_MCALTEMP_POLY_0,
+        ZFSIDX_MCALTEMP_POLY_0_p2,
+        ZFSIDX_MCALTEMP_POLY_0_p3,
+        ZFSIDX_MCALTEMP_POLY_0_p4,
+        ZFSIDX_MCALTEMP_POLY_1,
+        ZFSIDX_MCALTEMP_POLY_1_p2,
+        ZFSIDX_MCALTEMP_POLY_1_p3,
+        ZFSIDX_MCALTEMP_POLY_1_p4,
+        ZFSIDX_MCALTEMP_POLY_3,
+        ZFSIDX_MCALTEMP_POLY_3_p2,
+        ZFSIDX_MCALTEMP_POLY_3_p3,
+        ZFSIDX_MCALTEMP_POLY_3_p4,
+        ZFSIDX_MCALTEMP_POLY_8,
+        ZFSIDX_MCALTEMP_POLY_8_p2,
+        ZFSIDX_MCALTEMP_POLY_8_p3,
+        ZFSIDX_MCALTEMP_POLY_8_p4,
+
+        _ZFSIDX_MCALTEMP_BLOCKSIZE_ = (ZFSIDX_MCALTEMP_POLY_8_p4 + 1 - ZFSIDX_MCAL_START)
+    };
+
+
+    // Quality calibrarion
+    enum
+    {
+        ZFSIDX_QCAL_P1 = 15532,
+        ZFSIDX_QCAL_P2,
+        ZFSIDX_QCAL_P3,
+
+        ZFSIDX_QCAL_P4,
+        ZFSIDX_QCAL_P5,
+
+        ZFSIDX_QCAL_P6,
+        ZFSIDX_QCAL_P7,
+
+        ZFSIDX_QCAL_FLAG = 15539,
+
+        ZFSIDX_QCAL_P8,
+        ZFSIDX_QCAL_P9 = 15541,
+    };
+
+
+    // backup mcal
+    enum
+    {
+        ZFSIDX_BACKUP_MCAL_START = 15700,
+        ZFSIDX_BACKUP_MCAL_0 = ZFSIDX_BACKUP_MCAL_START,
+        ZFSIDX_BACKUP_MCAL_1,
+        ZFSIDX_BACKUP_MCAL_2,
+        ZFSIDX_BACKUP_MCAL_3,
+        ZFSIDX_BACKUP_MCAL_4,
+        ZFSIDX_BACKUP_MCAL_5,
+        ZFSIDX_BACKUP_MCAL_6,
+        ZFSIDX_BACKUP_MCAL_7,
+        ZFSIDX_BACKUP_MCAL_8,
+        ZFSIDX_BACKUP_MCAL_9,
+        ZFSIDX_BACKUP_MCAL_10,
+        ZFSIDX_BACKUP_MCAL_11,
+        ZFSIDX_BACKUP_MCAL_12,
+        ZFSIDX_BACKUP_MCAL_13,
+        ZFSIDX_BACKUP_MCAL_14,
+        ZFSIDX_BACKUP_MCAL_15,
+        ZFSIDX_BACKUP_MCAL_16,
+        ZFSIDX_BACKUP_MCAL_17,
+        ZFSIDX_BACKUP_MCAL_18,
+        ZFSIDX_BACKUP_MCAL_19,
+        ZFSIDX_BACKUP_MCAL_20,
+        ZFSIDX_BACKUP_MCAL_21,
+        ZFSIDX_BACKUP_MCAL_22,
+        ZFSIDX_BACKUP_MCAL_23,
+        ZFSIDX_BACKUP_MCAL_24,
+        ZFSIDX_BACKUP_MCAL_25,
+        ZFSIDX_BACKUP_MCAL_26,
+        ZFSIDX_BACKUP_MCAL_27,
+        ZFSIDX_BACKUP_MCAL_28,
+        ZFSIDX_BACKUP_MCAL_29,
+        ZFSIDX_BACKUP_MCAL_30,
+        ZFSIDX_BACKUP_MCAL_31,
+        ZFSIDX_BACKUP_45,           // Parameter 45
+        ZFSIDX_BACKUP_FLAG,         // Flag BackUp, 1 = original parameters used, 0 = patch Parameters used
+        ZFSIDX_BACKUP_QCAL_FLAG,    // ZFSIDX_QCAL_FLAG = 15539
+        ZFSIDX_BACKUP_MCALTEMP_FLAG,// ZFSIDX_MCALTEMP_FLAG = 15550
+		ZFSIDX_BACKUP_PATCH_FILE,   // Name of used patch file
+
+        _ZFSIDX_BACKUP_BLOCKSIZE_ = (ZFSIDX_BACKUP_PATCH_FILE + 1 - ZFSIDX_BACKUP_MCAL_START)
+
+    };
+
+} // end namespace zfs
+
+

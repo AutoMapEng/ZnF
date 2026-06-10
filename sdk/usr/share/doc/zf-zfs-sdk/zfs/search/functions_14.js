@@ -1,0 +1,6 @@
+var searchData=
+[
+  ['xyz_641',['XYZ',['../classZFSLinebyline.html#a8741244cd98b098d95c75364a9686243',1,'ZFSLinebyline']]],
+  ['xyz0_642',['XYZ0',['../classZFScanBasic.html#afe139a0c560f351edbadbf67ecdc783e',1,'ZFScanBasic::XYZ0(double rg, double henc, double lenc, double &amp;x, double &amp;y, double &amp;z) const'],['../classZFScanBasic.html#ac0dd4b9f36e439deaeca0b61ded7cee7',1,'ZFScanBasic::XYZ0(double &amp;, double &amp;, double &amp;) const override'],['../classZFSLinebyline.html#a21eb6268a286874f7a30321b0b4908f9',1,'ZFSLinebyline::XYZ0(double &amp;x, double &amp;y, double &amp;z, const ZFLineAccess *l=NULL) const'],['../classZFSLinebyline.html#ac25c3492ba22dd0ddf026621b7343c06',1,'ZFSLinebyline::XYZ0(double henc, double lenc, double rg, double &amp;x, double &amp;y, double &amp;z) const']]],
+  ['xyz2pos_643',['XYZ2POS',['../classZFScanBasic.html#ac832544aa050883c60a77e76e8e35bee',1,'ZFScanBasic::XYZ2POS(double, double, double, int &amp;, int &amp;, bool forceScdLayer=false, bool forCal=false)'],['../classZFScanBasic.html#a441bbd839340a13efda2593121a6aaeb',1,'ZFScanBasic::XYZ2POS(const zfs::math::Vec3d &amp;xyz, int &amp;u, int &amp;v, bool secondLayer=false)'],['../classZFSLinebyline.html#a3c5ae03546c2c6007ed538e44e6046aa',1,'ZFSLinebyline::XYZ2POS()']]]
+];

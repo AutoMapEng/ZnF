@@ -1,0 +1,7 @@
+<map id="Graphical Class Hierarchy" name="Graphical Class Hierarchy">
+<area shape="rect" id="node1" href="$classZFBase.html" title="base calss for all scans and objects" alt="" coords="5,56,76,83"/>
+<area shape="rect" id="node2" href="$classZFMask.html" title="mask for whole scan or a single part" alt="" coords="143,5,218,32"/>
+<area shape="rect" id="node4" href="$classZFSLinebyline.html" title="Basic class for lineByline access." alt="" coords="124,56,237,83"/>
+<area shape="rect" id="node5" href="$classZFTRMatrix.html" title="The 4x4 matrix that is used as a transformation matrix between 3d&#45;coordinate systems." alt="" coords="132,107,229,133"/>
+<area shape="rect" id="node3" href="$classZFMaskPartial.html" title=" " alt="" coords="285,5,400,32"/>
+</map>

@@ -1,0 +1,15 @@
+<map id="ZFScan" name="ZFScan">
+<area shape="rect" id="node1" title="ZFScan Abstact class for scanfile." alt="" coords="295,291,364,317"/>
+<area shape="rect" id="node6" href="$classZFRf.html" title="Class for printing output image of scan." alt="" coords="324,381,377,408"/>
+<area shape="rect" id="node2" href="$classZFScanBasic.html" title="Abstact class for scanfile." alt="" coords="104,184,208,211"/>
+<area shape="rect" id="node3" title=" " alt="" coords="174,81,277,108"/>
+<area shape="rect" id="node4" href="$classZFTRMatrix.html" title="The 4x4 matrix that is used as a transformation matrix between 3d&#45;coordinate systems." alt="" coords="53,81,150,108"/>
+<area shape="rect" id="node8" href="$classZFSLinebyline.html" title="Basic class for lineByline access." alt="" coords="365,509,478,535"/>
+<area shape="rect" id="node5" href="$classZFBase.html" title="base calss for all scans and objects" alt="" coords="235,5,306,32"/>
+<area shape="rect" id="node13" href="$classZFMask.html" title="mask for whole scan or a single part" alt="" coords="285,132,360,159"/>
+<area shape="rect" id="node7" href="$classZFRfParam.html" title="Holds parameter for setting the view&#45;mode of a ZFScan." alt="" coords="175,291,270,317"/>
+<area shape="rect" id="node9" href="$classZFSHeader.html" title=" " alt="" coords="485,381,579,408"/>
+<area shape="rect" id="node10" href="$classZFLineInfo.html" title=" " alt="" coords="717,291,808,317"/>
+<area shape="rect" id="node11" href="$classZFLineAccess.html" title=" " alt="" coords="603,381,714,408"/>
+<area shape="rect" id="node12" title=" " alt="" coords="625,291,692,317"/>
+</map>

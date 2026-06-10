@@ -1,0 +1,6 @@
+<map id="ZFScanBasic" name="ZFScanBasic">
+<area shape="rect" id="node1" title="Abstact class for scanfile." alt="" coords="46,172,150,199"/>
+<area shape="rect" id="node2" title=" " alt="" coords="5,81,108,108"/>
+<area shape="rect" id="node3" href="$classZFTRMatrix.html" title="The 4x4 matrix that is used as a transformation matrix between 3d&#45;coordinate systems." alt="" coords="132,81,229,108"/>
+<area shape="rect" id="node4" href="$classZFBase.html" title="base calss for all scans and objects" alt="" coords="145,5,216,32"/>
+</map>

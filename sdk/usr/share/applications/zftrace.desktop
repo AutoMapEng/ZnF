@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Encoding=UTF-8
+Name=Z+F Trace
+Comment=Receive Trace-Data from Z+F 3D Scanners and Profilers
+Comment[de]=Empfangen von Trace-Daten von Z+F 3D Scanner und Profiler
+Exec=ZFTrace
+Icon=/usr/share/icons/ZFTrace.ico
+Terminal=false

@@ -1,0 +1,24 @@
+var searchData=
+[
+  ['open_5fcreate_5ftemp_5fpos_779',['OPEN_CREATE_TEMP_POS',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da549548f69a4b74f0d279c0594b013844',1,'zfsdefs.h']]],
+  ['open_5fignor_5fcompensator_780',['OPEN_IGNOR_COMPENSATOR',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da3f2acc03f20067b6c2e18d81c4f3a406',1,'zfsdefs.h']]],
+  ['open_5fignor_5flevel_781',['OPEN_IGNOR_LEVEL',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4daeeec94b7857dc1b8366d9ee98af0ee3c',1,'zfsdefs.h']]],
+  ['open_5fignor_5frfcomp_782',['OPEN_IGNOR_RFCOMP',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da138706081f4d51628bc5bbb9f2cc8cc7',1,'zfsdefs.h']]],
+  ['open_5fignorcaltyp_783',['OPEN_IGNORCALTYP',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4daed762c36c0f110fae0c8d342de800a22',1,'zfsdefs.h']]],
+  ['open_5flogging_784',['OPEN_LOGGING',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da0756ae0435e9f6cc6b929d3fe9f25737',1,'zfsdefs.h']]],
+  ['open_5fmultiopen_785',['OPEN_MULTIOPEN',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4dafb3d6c5b65215cc36ed8215d4c565f6f',1,'zfsdefs.h']]],
+  ['open_5fnew_5fmask_786',['OPEN_NEW_MASK',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da5ddaa87bdbbfea5290118d0291eb915b',1,'zfsdefs.h']]],
+  ['open_5fnocallbacks_787',['OPEN_NOCALLBACKS',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4dacb0adb00425180bc6d6f45379aecb354',1,'zfsdefs.h']]],
+  ['open_5fnoimage_788',['OPEN_NOIMAGE',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4dad81798f4a19c8ae1a9ef43cf532c13ce',1,'zfsdefs.h']]],
+  ['open_5fnomasks_789',['OPEN_NOMASKS',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da9910a3dd6b98c4ab4dc44fc60da96d7f',1,'zfsdefs.h']]],
+  ['open_5fnoprenext_790',['OPEN_NOPRENEXT',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da67cade4976728883ba95d7a168bdc5fc',1,'zfsdefs.h']]],
+  ['open_5fnoscanlist_791',['OPEN_NOSCANLIST',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da2bd67b3a9acfbf644998f144283c7cf0',1,'zfsdefs.h']]],
+  ['open_5fphysical_792',['OPEN_PHYSICAL',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4daf80d4fa482d0125ffee342acf6a380df',1,'zfsdefs.h']]],
+  ['open_5fread_5fmasks_793',['OPEN_READ_MASKS',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da989ba736b71c2e81a4ffeebd0b9beb2e',1,'zfsdefs.h']]],
+  ['open_5frw_794',['OPEN_RW',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da9caddaa22319233f98b8b1cf56c9eff4',1,'zfsdefs.h']]],
+  ['open_5fsingle_795',['OPEN_SINGLE',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da94de783bd4b7571f6a399d6f93d2010e',1,'zfsdefs.h']]],
+  ['open_5funahe_796',['OPEN_UNAHE',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4dae7039c8b502e87dfe753bcc0abbebb79',1,'zfsdefs.h']]],
+  ['open_5funtil_5flast_797',['OPEN_UNTIL_LAST',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4dae09651b142cdf6710d9050faa241f7c8',1,'zfsdefs.h']]],
+  ['open_5fusematrix_5f320_798',['OPEN_USEMATRIX_320',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da56aa55ab216c96f44d21c99706c49688',1,'zfsdefs.h']]],
+  ['open_5fxyz2pos_799',['OPEN_XYZ2POS',['../zfsdefs_8h.html#a16af7b253440dadd46a80a4b9fddba4da779c21d54eda8445599090dac3e7f76d',1,'zfsdefs.h']]]
+];

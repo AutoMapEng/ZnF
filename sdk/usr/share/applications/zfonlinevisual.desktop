@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Encoding=UTF-8
+Name=Z+F OnlineVisual
+Comment=Receive RAW Data Data from Z+F Imager and Profiler
+Comment[de]=Empfangen von Roh Daten von Z+F Imager und Profiler
+Exec=Z+F-OnlineVisual
+Icon=/usr/share/icons/zfonlinevisual.ico
+Terminal=false
+

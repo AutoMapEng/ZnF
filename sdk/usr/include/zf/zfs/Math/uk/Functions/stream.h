@@ -1,0 +1,2 @@
+char *form(const char *, ...);
+

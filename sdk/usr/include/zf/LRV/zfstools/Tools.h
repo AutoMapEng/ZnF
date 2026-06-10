@@ -1,0 +1,4 @@
+#ifndef __ZFSTOOLS_TOOLS_OLD_H__
+#define __ZFSTOOLS_TOOLS_OLD_H__
+
+#endif //__ZFSTOOLS_TOOLS_OLD_H__

@@ -1,0 +1,212 @@
+#pragma once
+
+#include <string>
+#include <iostream>
+#include <fstream>
+#include <cstdint>
+
+#include "filterapi.h"
+#include "basic/all.h"
+#include "datasetparam.h"
+
+#include "Matrix.h"
+
+namespace zfs
+{
+    namespace math
+    {
+        template<class T> class Point3D;
+    }
+}
+
+namespace zfsfilter 
+{
+//#define EN_DEBUG_WRITEMATRIX
+
+    // ============================================================================================================
+    /** \class BasicFilter
+    * \brief  Base class for filters (Mixed Pixel Filter, Road Sign Filter).
+    *
+    * \author Juergen Holzner
+    *
+    * Base class for filters (Mixed Pixel Filter, Road Sign Filter).
+    *
+    */
+    class FILTERDLL_API BasicFilter
+    {
+    private:
+        // data set parameter
+        zfs::DatasetParameter*                m_DataSetParameter;  ///< data set parameter
+
+    protected:
+
+        // -- member variables
+
+        // bool indicators
+        bool                   m_bOutputReport;                   ///< Indicates if a output report should be given (to output message window)
+        bool                   m_FilteringWasCancelledByUser;     ///< Stores if filtering is cancelled by user
+        bool                   m_Processed;                       ///< Indicates if data set was processed
+        bool                   m_ShowProgress;                    ///< Indicates if progress(bar) is to be showed
+        bool                   m_bDataSetParameterAreExternal;    ///< Indicates if data set parameter are generated externally
+
+                                                                  // data set data
+        int32_t                m_NumberOfLinesToProcess;          ///< Keeps the number of lines to be processed (depends on user selection)
+        int32_t                m_NumberOfPixelsToProcessPerLine;  ///< Number of pixels to process per line (depends on user selection)
+        int32_t                m_TotalNumberOfSamplesProcessed;   ///< Total Number of samples processed (product of m_NumberOfLinesToProcess and m_NumberOfPixelsToProcessPerLine)
+                                                                  ///< Care must be taken to update this number correctly in conjunction with the above (if this number is used/required)
+
+                                                                  // correction/masking/filter statistics
+        int32_t                m_CorrectedPixelCounter;           ///< Number of corrected pixels
+        int32_t                m_CorrectedLinesCounter;           ///< Number of corrected lines
+        int32_t                m_FilteredLinesCounter;            ///< Number of filtered lines
+        int32_t                m_MaskedPixelCounter;              ///< Number of masked pixels
+        int32_t                m_CheckedPixelsCounter;            ///< Number of checked pixels / number of pixels that where filtered by preceeding filters
+
+                                                                  // area to process (user)
+        int32_t                m_PixelStart;                      ///< start pixel number (user selection)
+        int32_t                m_PixelEnd;                        ///< end pixel number (user selection)
+        int32_t                m_PixelSubsample;                  ///< subsampling for pixel
+
+        int32_t                m_LineStart;                       ///< start line number (user selection)
+        int32_t                m_LineEnd;                         ///< end line number (user selection)
+        int32_t                m_LineSubsample;                   ///< subsampling for line
+                                                                  // processing report data
+        double                 m_CorrectedPixelPercentage;        ///< percentage of corrected pixels (e.g. by smoothing)
+        double                 m_MaskedPixelPercentage;           ///< percentage of masked pixels (by filtering)  
+
+                                                                  // filtering results
+        FilterResultItem       m_FilterResultItem;                ///< filter result item
+
+                                                                  // -- members for integrated debugging
+        bool                   m_WriteDebugFiles;                 ///< Must be set in derived filter classes/objects
+        std::wstring           m_DebugFileDirectory;              ///< Contains the directory where the debug files are written to, Must be set in derived filter classes/objects
+
+        // -- members for integrated logging
+        bool                   m_EnableLogging;                   ///< Must be set to enable logging
+
+        std::string            m_FilterName;                      ///< Filter name
+
+        std::ofstream          m_LoggingOut;
+        std::string            m_Logging_Prefix;
+
+        Matrix<bool>           m_FilterMask;                      ///< Mask generated by filter
+
+        // -- member functions
+        void basic_initialization();
+
+        // -- debugging helper function
+        template< class T> bool writeMatrixToDisk( const std::wstring& aFilename, const Matrix<T>& aMatrixToWrite ) const;
+        template< class T> bool writeMatrixToDisk( const std::wstring& aFilename, const MatrixBase<zfs::math::Point3D<T>>& aMatrixToWrite ) const;
+
+        template< class T> bool writeVectorToDisk( const std::wstring& aFilename, const std::vector<T>& aMatrixToWrite ) const;
+        template< class T> bool writeVectorToDisk( const std::wstring& aFilename, const std::vector<zfs::math::Point3D<T>>& aMatrixToWrite ) const;
+
+    public:
+
+        // -- constructor (for init only)
+        BasicFilter();
+
+        BasicFilter( const int32_t      a_LineStart,
+                     const int32_t      a_LineEnd,
+                     const int32_t      a_PixelStart,
+                     const int32_t      a_PixelEnd,
+                     const bool&         a_bOutputReport );
+                                         
+        BasicFilter( const int32_t      a_LineStart,
+                     const int32_t      a_LineEnd,
+                     const int32_t      a_LineSubsample,
+                     const int32_t      a_PixelStart,
+                     const int32_t      a_PixelEnd,
+                     const int32_t      a_PixelSubsample,
+                     const bool&         a_bOutputReport );
+                                         
+        BasicFilter( const bool          a_bWriteDebugFiles,
+                     const std::wstring& a_DebugFileDirectory );
+                                         
+        BasicFilter( const int32_t      a_LineStart,
+                     const int32_t      a_LineEnd,
+                     const int32_t      a_PixelStart,
+                     const int32_t      a_PixelEnd,
+                     const bool&         a_bOutputReport,
+                     const bool&         a_bWriteDebugFiles,
+                     const std::wstring& a_DebugFileDirectory);
+                                         
+        BasicFilter( const int32_t      a_LineStart,
+                     const int32_t      a_LineEnd,
+                     const int32_t      a_LineSubsample,
+                     const int32_t      a_PixelStart,
+                     const int32_t      a_PixelEnd,
+                     const int32_t      a_PixelSubsample,
+                     const bool&         a_bOutputReport,
+                     const bool&         a_bWriteDebugFiles,
+                     const std::wstring& a_DebugFileDirectory );
+
+        virtual ~BasicFilter();
+
+        // -- setter
+        void   setDebugFileInfo( const bool          a_bWriteDebugFiles,
+                                 const std::wstring& a_DebugFileDirectory);
+
+        void   setDataSetParameter( const zfs::DatasetParameter* const apDataSetParameter,
+                                    const int32_t a_LineSubsample= 1,
+                                    const int32_t a_PixelSubsample= 1,
+                                    const bool& a_IsOpenedInSingleMode= false);
+
+        void   setDataSetParameter( ZFSHeader* const apZFSHeader,
+                                    const int32_t a_LineSubsample= 1,
+                                    const int32_t a_PixelSubsample = 1,
+                                    const bool& a_IsOpenedInSingleMode= false);
+               
+        void   setProcessingExtends( const int32_t a_LineStart= 0,
+                                     const int32_t a_LineEnd = -1,
+                                     const int32_t a_LineSubsample= 1,
+                                     const int32_t a_PixelStart= 0,
+                                     const int32_t a_PixelEnd= -1,
+                                     const int32_t a_PixelSubsample= 1,
+                                     const bool& a_IsOpenedSinglePartOrImagerDataset=false);
+
+        void   setSubsampling( const int32_t a_LineSubsample= 1,
+                               const int32_t a_PixelSubsample= 1);
+               
+        void   setOutputReport( const bool& a_bOutputReport );
+
+        // -- getter
+        bool   IsProcessCancelledByUser() const;
+
+        int32_t getNumberOfPixelsToProcessPerLine() const;
+        int32_t getNumberOfLinesToProcess() const;
+        int32_t getCorrectedPixelCounter() const;
+        int32_t getCorrectedLinesCounter() const;
+        int32_t getPixelStart() const;
+        int32_t getPixelEnd() const;
+        int32_t getPixelSubsample() const;
+        int32_t getLineStart() const;
+        int32_t getLineEnd() const;
+        int32_t getLineSubsample() const;
+
+        // ---- filter result data
+        const Matrix<bool>& getResultMask() const;
+
+        int32_t getFilteredLinesCounter() const;
+        int32_t getMaskedPixelCounter() const;
+        int32_t getNumberOfElementsFilteredOut() const;
+
+        double getCorrectedPixelPercentage() const;
+
+        // -- data set parameter
+        const  zfs::DatasetParameter* const getDataSetParameter() const;
+        zfs::DatasetParameter* getDataSetParameter();
+
+        // -- geometrical operator (recalculation of x,y,z positions if these were filtered)
+        template <class T> void newXYZforNewRg(const T& rg_old, const T& x_old, const T& y_old, const T& z_old, const T& rg_new, T& x_new, T& y_new, T& z_new ) const;
+
+        // -- operators
+        void   UpdatePixelPercentageProcessed(const int32_t nPixelsChecked= -1);
+        void   setShowProgress( const bool& a_ShowProgress );
+
+        bool   OpenLogFile( std::string aLogFileName, std::string aLogPrefix);
+        void   WriteToLogFile(std::string aLogMessage);
+        void   CloseLogFile();
+
+    };
+} //namespace zfsfilter 
