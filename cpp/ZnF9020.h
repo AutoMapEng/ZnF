@@ -96,13 +96,16 @@ private:
     int  pixel_ = -1;
     long lines_ = 0, pts_ = 0;
     std::vector<unsigned char> payload_, inflated_, lineheader_;
+    std::vector<float> prev_r_;   // last profile's full decode, per direction
+                                  // (temporal confirmation of chained pixels)
+    int warm_n_ = 0;              // healthy profiles seen (hysteresis warmup)
 
     ProfileCallback   on_profile_;
     std::atomic<bool> abort_{false};
 
     std::string buildScanCommand() const;
     FrameRes    readFrame(uint16_t& type, std::vector<unsigned char>& payload);
-    long        decodeProfile(const unsigned char* data, size_t n, double t_s, double x) const;
+    long        decodeProfile(const unsigned char* data, size_t n, double t_s, double x);
 
     // generic helpers (no scanner state). Sockets are O_NONBLOCK; every wait
     // goes through waitFd()/poll() with a timeout, so no call can hang.

@@ -112,6 +112,7 @@ void ZnF9020::ensureIdle(double wait) {
 // scanning / streaming
 // --------------------------------------------------------------------------- //
 bool ZnF9020::startScan() {
+    prev_r_.clear(); warm_n_ = 0;            // fresh temporal state per scan
     fprintf(stderr, "# version: %.80s ...\n", command("version").c_str());
     ensureIdle();
     sleep_s(0.5);
@@ -237,7 +238,7 @@ ZnF9020::FrameRes ZnF9020::readFrame(uint16_t& type, std::vector<unsigned char>&
     return FRAME_OK;
 }
 
-long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, double x) const {
+long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, double x) {
     const uint16_t* u = (const uint16_t*)data;       // host is LE
     if (pixel_ <= 0 || n < (size_t)pixel_ * 8) return 0;
     // Layout: pixel_/2 directions. plane0[half+j] is the range channel; in the
@@ -265,8 +266,16 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
     static constexpr int    GAP_BRIDGE  = 96;     // validated-bridge max gap
     static constexpr int    BRIDGE_MIN  = 12;     // px to validate a bridge
     static constexpr int    BRIDGE_DIV  = 4;      // distinct raws to validate
+    static constexpr double BRIDGE_ENTRY_TOL = 0.70; // bridge must CONTINUE the
+                                                  // surface: a depth jump at a
+                                                  // long gap may not start one
+                                                  // (folded-wall ghosts did)
     static constexpr double CHAIN_TOL_M = 1.5;    // chain tolerance cap
     static constexpr double SLOPE_MAX   = 0.35;   // chain slope cap [m/px]
+    static constexpr double TEMPORAL_TOL = 0.40;  // chained px must match the
+                                                  // previous profile (+/-1 px)
+                                                  // to be emitted (anchors are
+                                                  // exempt; kills k-flicker)
     const int dirs = pixel_ / 2;
     const uint16_t* pf = u + dirs;
     const uint16_t* pa = u + pixel_ + dirs;
@@ -286,19 +295,23 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
         if (abuf[j] <= cfg_.min_amp) continue;
         real[j] = 1;
     }
+    std::vector<unsigned char> seeded(dirs, 0);      // plane2-verified px
+    int anchors_n = dirs, real_n = 0;                // plane2 anchors this line
+    for (int j = 0; j < dirs; ++j) real_n += real[j];
     if (!cfg_.unwrap) {                              // fold at 6.55 m, no plane2
         for (int j = 0; j < dirs; ++j)
-            if (real[j] && fine[j] >= SENTINEL_M) rbuf[j] = fine[j];
+            if (real[j] && fine[j] >= SENTINEL_M) { rbuf[j] = fine[j]; seeded[j] = 1; }
     } else {
+        std::vector<unsigned char> secmeas(dirs, 0); // plane2 actually measuring
         std::vector<int> ai; ai.reserve(dirs / 2);
         for (int j = 0; j < dirs; ++j) {
-            if (!real[j]) continue;
             int parked = 0;                          // exact plane2 repeats
             for (int o = -PARKED_NB; o <= PARKED_NB; ++o) {
                 if (!o) continue;
                 if (pc[(j + o + dirs) % dirs] == pc[j]) ++parked;
             }
-            if (parked >= PARKED_MIN || sec[j] < SEC_MIN_M) continue;
+            secmeas[j] = (parked < PARKED_MIN && sec[j] >= SEC_MIN_M);
+            if (!real[j] || !secmeas[j]) continue;
             double kk = std::round((sec[j] - fine[j]) / AMBIG_M);
             if (kk < 0) kk = 0; else if (kk > 2) kk = 2;
             double r = fine[j] + kk * AMBIG_M;
@@ -309,14 +322,63 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
         }
         // consensus: an anchor seeds chains only if its k agrees with the
         // neighbourhood (lone garbage anchors would seed fold ghosts)
+        anchors_n = (int)ai.size();
         const int na = (int)ai.size();
         for (int t = 0, lo = 0, hi = 0; t < na; ++t) {
             while (lo < na && ai[lo] < ai[t] - CONS_WIN) ++lo;
             while (hi < na && ai[hi] <= ai[t] + CONS_WIN) ++hi;
             int same = 0;
             for (int q = lo; q < hi; ++q) if (ksec[ai[q]] == ksec[ai[t]]) ++same;
-            if (hi - lo >= CONS_MIN && (double)same >= CONS_FRAC * (hi - lo))
-                rbuf[ai[t]] = fine[ai[t]] + ksec[ai[t]] * AMBIG_M;
+            if (hi - lo >= CONS_MIN && (double)same >= CONS_FRAC * (hi - lo)) {
+                int jj = ai[t];
+                // wrap-trap demotion: a k=0 seed (plane2 ~ plane0 carries no
+                // wrap info) on a direction already locked at k>=1 yields to
+                // the lock - the hysteresis pass will paint it at k>=1.
+                if (ksec[jj] == 0 && (int)prev_r_.size() == dirs &&
+                    warm_n_ >= 8 && prev_r_[jj] > 0.0f) {
+                    // exact-j only: reading NEIGHBOUR locks here lets a k>=1
+                    // region alias-creep over adjacent true-k0 seeds (ratchet)
+                    double kp = std::round(((double)prev_r_[jj] - fine[jj]) / AMBIG_M);
+                    if (kp >= 1 && kp <= 2 &&
+                        std::fabs(fine[jj] + kp * AMBIG_M - (double)prev_r_[jj])
+                            <= TEMPORAL_TOL)
+                        continue;
+                }
+                rbuf[jj] = fine[jj] + ksec[jj] * AMBIG_M;
+                seeded[jj] = 1;
+            }
+        }
+        // plane2 veto: a chained pixel whose plane2 MEASURES (jitters, >=0.4 m)
+        // yet matches NO wrap alias of plane0 is a mixed pixel (plane2 locked
+        // a different echo) - paint it at no k. A plane2 that matches some
+        // alias merely cannot RESOLVE k (it may wrap like plane0) - no veto.
+        auto secveto = [&](int j, double) {
+            if (!secmeas[j]) return false;
+            double d = std::fabs(sec[j] - fine[j]);
+            for (int kq = 1; kq <= 2; ++kq)
+                d = std::min(d, std::fabs(sec[j] - fine[j] - kq * AMBIG_M));
+            return d > 2.5;
+        };
+        // previous-profile k hysteresis: once a direction's wrap count is
+        // established (e.g. the far wall painted at k=1 via the ceiling-corner
+        // chain), it sticks across profiles - an alias slide (a folded surface
+        // numerically continuing a closer one, e.g. chair -> wrapped wall at
+        // k=0) cannot re-claim the sector on later profiles.
+        std::vector<unsigned char> prevpass(dirs, 0);
+        if ((int)prev_r_.size() == dirs && warm_n_ >= 8) {
+            for (int j = 0; j < dirs; ++j) {
+                if (rbuf[j] > 0.0 || !real[j] || prev_r_[j] <= 0.0f) continue;
+                double kp = std::round(((double)prev_r_[j] - fine[j]) / AMBIG_M);
+                if (kp < 1 || kp > 2) continue;  // never lock k=0: the fold
+                                                 // alias is k=0 by construction
+                                                 // and close content re-anchors
+                                                 // via plane2 every profile
+                double cand = fine[j] + kp * AMBIG_M;
+                if (std::fabs(cand - (double)prev_r_[j]) > TEMPORAL_TOL) continue;
+                if (kp == 0 && fine[j] < SENTINEL_M) continue;
+                if (secveto(j, cand)) continue;
+                rbuf[j] = cand; prevpass[j] = 1;     // chained (not seeded)
+            }
         }
         // continuity chains (both sweep directions): resolve k for pixels whose
         // plane2 parked, by predicting r from the running surface; long gaps
@@ -327,12 +389,55 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
             long last_j = -(1L << 30), prev_j = -(1L << 30);
             double last_r = 0.0, prev_r = 0.0;
             bool bridging = false; pend.clear();
+            // fold-crossing credential: only a chain that has ITSELF stepped
+            // k by +/-1 across a tight gap (the genuine wrap-crossing
+            // signature) may re-key seeded pixels. Chains that merely ride
+            // pre-painted state (captures) never earn it - otherwise locked
+            // junk ratchets the whole room up one wrap, profile by profile.
+            bool cred = false; int last_k = 0;
             for (int t = 0; t < dirs; ++t) {
                 int i = sweep ? dirs - 1 - t : t;
                 if (rbuf[i] > 0.0) {
+                    // chain-context override: plane2's wrap ambiguity can seed
+                    // k=0 on FOLDED content (it wraps like plane0: sec 0.93 ~
+                    // fine 0.90 for a surface truly at 7.45 m). A live chain
+                    // carrying the true surface bumps such a pixel one wrap up
+                    // when k+1 fits it tightly and the k=0 reading does not.
+                    // A pixel that CONFLICTS with the live chain but cannot be
+                    // re-keyed is transparent: it must not capture the chain
+                    // (one veto-blocked pixel would hand the whole downstream
+                    // sector to the fold alias).
+                    bool ovr = cred &&
+                               ((seeded[i] && ksec[i] == 0) || prevpass[i]) &&
+                               rbuf[i] - fine[i] < 0.5 * AMBIG_M;
+                    if (ovr && last_j > -(1L << 29) &&
+                        std::labs(i - last_j) <= GAP_STRICT) {
+                        long gap0 = std::labs(i - last_j);
+                        double slope0 = 0.0;
+                        long dj0 = last_j - prev_j;
+                        if (dj0 != 0 && std::labs(dj0) <= 4) {
+                            slope0 = (last_r - prev_r) / (double)dj0;
+                            if (slope0 > SLOPE_MAX) slope0 = SLOPE_MAX;
+                            if (slope0 < -SLOPE_MAX) slope0 = -SLOPE_MAX;
+                        }
+                        double pred0 = last_r + slope0 * (double)(i - last_j);
+                        double tol0 = 0.25 + 0.05 * (double)gap0;
+                        if (tol0 > CHAIN_TOL_M) tol0 = CHAIN_TOL_M;
+                        double up = rbuf[i] + AMBIG_M;
+                        if (std::fabs(up - pred0) <= tol0 &&
+                            std::fabs(rbuf[i] - pred0) > tol0 &&
+                            !secveto(i, up)) {
+                            rbuf[i] = up;                // re-keyed one wrap up
+                            seeded[i] = 0; prevpass[i] = 0;  // chain-grade now
+                        } else if (std::fabs(rbuf[i] - pred0) > tol0) {
+                            continue;                    // conflicting: transparent
+                        }
+                    }
                     if (bridging) { pend.clear(); bridging = false; }
+                    {   double kr = std::round((rbuf[i] - fine[i]) / AMBIG_M);
+                        last_k = kr < 0 ? 0 : (kr > 2 ? 2 : (int)kr); }
                     prev_j = last_j; prev_r = last_r; last_j = i; last_r = rbuf[i];
-                    continue;
+                    continue;                        // captures never grant cred
                 }
                 if (!real[i]) continue;
                 long gap = std::labs(i - last_j);
@@ -351,8 +456,9 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
                 double tol = 0.25 + 0.05 * (double)gap;
                 if (tol > CHAIN_TOL_M) tol = CHAIN_TOL_M;
                 if (std::fabs(cand - pred) <= tol &&
-                    !(kk == 0 && fine[i] < SENTINEL_M)) {
+                    !(kk == 0 && fine[i] < SENTINEL_M) && !secveto(i, cand)) {
                     if (gap > GAP_STRICT && !bridging) {
+                        if (std::fabs(cand - pred) > BRIDGE_ENTRY_TOL) continue;
                         bridging = true; pend.clear();
                         pend.push_back({i, cand, pf[i], anch[i]});
                     } else if (bridging) {
@@ -374,20 +480,68 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
                     } else {
                         rbuf[i] = cand;
                     }
+                    if (gap <= 8 && last_j > -(1L << 29) &&
+                        std::abs((int)kk - last_k) == 1)
+                        cred = true;                 // genuine fold crossing
+                    last_k = (int)kk;
                     prev_j = last_j; prev_r = last_r; last_j = i; last_r = cand;
                 } else if (bridging) {
                     pend.clear(); bridging = false;
-                    last_j = -(1L << 30);            // restart from next seed
+                    last_j = -(1L << 30); cred = false; // restart from next seed
                 }
             }
         }
     }
     std::vector<unsigned char> ok(dirs, 0);
+    const bool warm = (int)prev_r_.size() == dirs;
+    std::vector<float> cur(dirs, 0.0f);
     for (int j = 0; j < dirs; ++j) {
         if (rbuf[j] <= 0.0) continue;
         if (rbuf[j] > 200.0) continue;               // spec max-range guard
         if (rbuf[j] < cfg_.min_range_m) continue;
-        ok[j] = 1;
+        ok[j] = 1; cur[j] = (float)rbuf[j];
+    }
+    // temporal confirmation: a CHAINED pixel (no plane2 verification) is only
+    // emitted once the previous profile agrees at the same direction (+/-1 px).
+    // One-profile warmup for new structures; kills per-profile k-flicker.
+    for (int j = 0; j < dirs; ++j) {
+        if (!ok[j] || seeded[j]) continue;
+        bool conf = false;
+        if (warm)
+            for (int o = -1; o <= 1 && !conf; ++o) {
+                int q = j + o;
+                if (q >= 0 && q < dirs && prev_r_[q] > 0.0f &&
+                    std::fabs(prev_r_[q] - rbuf[j]) <= TEMPORAL_TOL) conf = true;
+            }
+        if (!conf) ok[j] = 0;
+    }
+    // fold-corner fuzz: a plane2-seeded k=0 pixel whose NEIGHBOUR direction
+    // is locked at k>=1 consistent with this pixel's fine is wrap-ambiguous -
+    // suppress its EMISSION only (the state keeps the full decode: no
+    // feedback, so unlike seed demotion at +/-1 this cannot alias-creep).
+    if (cfg_.unwrap && warm && warm_n_ >= 8) {
+        for (int j = 0; j < dirs; ++j) {
+            if (!ok[j] || !seeded[j] || ksec[j] != 0) continue;
+            bool amb = false;
+            for (int o = -1; o <= 1 && !amb; ++o) {
+                int q = j + o;
+                if (q < 0 || q >= dirs || prev_r_[q] <= 0.0f) continue;
+                double kp = std::round(((double)prev_r_[q] - fine[j]) / AMBIG_M);
+                if (kp >= 1 && kp <= 2 &&
+                    std::fabs(fine[j] + kp * AMBIG_M - (double)prev_r_[q])
+                        <= TEMPORAL_TOL)
+                    amb = true;
+            }
+            if (amb) ok[j] = 0;
+        }
+    }
+    // spin-up/transition junk (plane2 globally dead: laser on but anchors a
+    // tiny FRACTION of real pixels - healthy lines run ~25-60%) must not
+    // poison the temporal state; otherwise remember the FULL decode
+    // (pre-suppression) so new stable structures confirm on the next profile
+    if (anchors_n >= 16 && 10 * anchors_n >= real_n) {
+        prev_r_.swap(cur);
+        ++warm_n_;            // hysteresis activates after 8 healthy profiles
     }
 
     // pass 2: mixed-pixel (edge-trail) filter - drop points whose local chord
