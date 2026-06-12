@@ -1,6 +1,6 @@
 // acquire.cpp - CLI entry point for the Z+F PROFILER 9020 driver.
 // All scanner-control logic lives in the ZnF9020 class (ZnF9020.h / ZnF9020.cpp);
-// main() just parses options, constructs one, and calls start().
+// main() just parses options, constructs one, and calls Start().
 #include "ZnF9020.h"
 
 #include <cstdio>
@@ -30,7 +30,7 @@ static void usage() {
         "  --local-ip IP      override local IP advertised to scanner\n");
 }
 
-static bool parse_args(int argc, char** argv, ZnF9020::Config& a) {
+static bool parseArgs(int argc, char** argv, ZnF9020::Config& a) {
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
         auto val = [&](const char* name) -> const char* {
@@ -65,8 +65,8 @@ static bool parse_args(int argc, char** argv, ZnF9020::Config& a) {
 int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
     ZnF9020::Config cfg;
-    if (!parse_args(argc, argv, cfg)) { usage(); return 2; }
+    if (!parseArgs(argc, argv, cfg)) { usage(); return 2; }
 
     ZnF9020 scanner(cfg);              // create the scanner controller
-    return scanner.start() ? 0 : 1;    // start the system
+    return scanner.Start() ? 0 : 1;    // start the system
 }

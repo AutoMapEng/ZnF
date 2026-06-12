@@ -18,67 +18,82 @@
 #include <arpa/inet.h>
 #include <zlib.h>
 
-static double now_s() {
+static double nowSeconds() {
     using clk = std::chrono::steady_clock;
     return std::chrono::duration<double>(clk::now().time_since_epoch()).count();
 }
-static void sleep_s(double s) {
+static void sleepSeconds(double s) {
     std::this_thread::sleep_for(std::chrono::duration<double>(s));
 }
 
 // poll() timeouts: while idle between frames we wake every MARKER_TIMEOUT_S so
-// streamFor() can check its deadline; a stall in the MIDDLE of a frame or while
+// StreamFor() can check its deadline; a stall in the MIDDLE of a frame or while
 // sending a command is treated as an error/failure instead of waiting forever.
 static constexpr double MARKER_TIMEOUT_S     = 1.0;
 static constexpr double FRAME_IDLE_TIMEOUT_S = 3.0;
 static constexpr double SEND_TIMEOUT_S       = 5.0;
 
 // --------------------------------------------------------------------------- //
+// UniqueFd - RAII socket descriptor (close() lives here and nowhere else)
+// --------------------------------------------------------------------------- //
+ZnF9020::UniqueFd::~UniqueFd() { Reset(); }
+
+ZnF9020::UniqueFd& ZnF9020::UniqueFd::operator=(UniqueFd&& o) noexcept {
+    if (this != &o) { Reset(o.m_fd); o.m_fd = -1; }
+    return *this;
+}
+
+void ZnF9020::UniqueFd::Reset(int fd) noexcept {
+    if (m_fd >= 0) close(m_fd);
+    m_fd = fd;
+}
+
+// --------------------------------------------------------------------------- //
 // lifecycle
 // --------------------------------------------------------------------------- //
-ZnF9020::ZnF9020(const Config& cfg) : cfg_(cfg) {}
-ZnF9020::~ZnF9020() { stop(); disconnect(); }
+ZnF9020::ZnF9020(const Config& cfg) : m_cfg(cfg) {}
+ZnF9020::~ZnF9020() { Stop(); Disconnect(); }
 
-bool ZnF9020::start() {
-    local_ = cfg_.local_ip.empty() ? localIp(cfg_.ip) : cfg_.local_ip;
-    scan_cmd_ = buildScanCommand();              // built once (unique file name)
+bool ZnF9020::Start() {
+    m_local = m_cfg.local_ip.empty() ? localIp(m_cfg.ip) : m_cfg.local_ip;
+    m_scanCmd = buildScanCommand();              // built once (unique file name)
     fprintf(stderr, "# connecting to scanner %s (command :%d, stream :%d)\n",
-            cfg_.ip.c_str(), PORT_COMMAND, PORT_STREAM);
-    fprintf(stderr, "# local ip advertised: %s\n", local_.c_str());
-    fprintf(stderr, "# scan command: %s\n", scan_cmd_.c_str());
+            m_cfg.ip.c_str(), PORT_COMMAND, PORT_STREAM);
+    fprintf(stderr, "# local ip advertised: %s\n", m_local.c_str());
+    fprintf(stderr, "# scan command: %s\n", m_scanCmd.c_str());
 
-    if (!connect()) {
+    if (!Connect()) {
         fprintf(stderr, "!! cannot reach scanner command port %s:%d\n",
-                cfg_.ip.c_str(), PORT_COMMAND);
-        if (local_ == cfg_.ip)
+                m_cfg.ip.c_str(), PORT_COMMAND);
+        if (m_local == m_cfg.ip)
             fprintf(stderr, "   (that is THIS PC's own IP - use the scanner's address)\n");
         return false;
     }
-    if (!startScan()) { stop(); return false; }
+    if (!StartScan()) { Stop(); return false; }
 
-    if (!on_profile_)
+    if (!m_onProfile)
         printf("# t[s]      x[m]      y[m]      z[m]   intensity\n");
-    streamFor(cfg_.seconds);
-    stop();
+    StreamFor(m_cfg.seconds);
+    Stop();
     return true;
 }
 
 // --------------------------------------------------------------------------- //
 // command channel
 // --------------------------------------------------------------------------- //
-bool ZnF9020::connect() {
-    cmd_fd_ = connectTcp(cfg_.ip, PORT_COMMAND);
-    return cmd_fd_ >= 0;
+bool ZnF9020::Connect() {
+    m_cmdFd.Reset(connectTcp(m_cfg.ip, PORT_COMMAND));
+    return m_cmdFd.Valid();
 }
 
-std::string ZnF9020::command(const std::string& text, double wait) {
-    if (cmd_fd_ < 0) return "";
-    if (!sendAll(cmd_fd_, text + "\r\n", SEND_TIMEOUT_S)) return "";
+std::string ZnF9020::Command(const std::string& text, double wait) {
+    if (!m_cmdFd.Valid()) return "";
+    if (!sendAll(m_cmdFd.Get(), text + "\r\n", SEND_TIMEOUT_S)) return "";
     std::string reply;
     char buf[4096];
     for (;;) {
-        if (!waitFd(cmd_fd_, POLLIN, wait)) break;       // no (more) data in time
-        ssize_t r = recv(cmd_fd_, buf, sizeof(buf), 0);
+        if (!waitFd(m_cmdFd.Get(), POLLIN, wait)) break; // no (more) data in time
+        const ssize_t r = recv(m_cmdFd.Get(), buf, sizeof(buf), 0);
         if (r > 0) {
             reply.append(buf, (size_t)r);
             if (reply.find("</xml>") != std::string::npos) break;
@@ -91,16 +106,16 @@ std::string ZnF9020::command(const std::string& text, double wait) {
     return reply;
 }
 
-void ZnF9020::ensureIdle(double wait) {
+void ZnF9020::EnsureIdle(double wait) {
     const long BUSY = (1<<1)|(1<<2)|(1<<3)|(1<<15);   // STREAM|SCAN|ERR|STARTUP
     std::string st;
     for (int i = 0; i < 12; ++i) {
-        st = command("status", wait);
+        st = Command("status", wait);
         if (st.find("<messagebox") != std::string::npos) {
-            command(affirmative(st), wait); sleep_s(0.3); continue;
+            Command(affirmative(st), wait); sleepSeconds(0.3); continue;
         }
         long s = 0;
-        if (statusInt(st, s) && (s & BUSY)) { command("stop", wait); sleep_s(0.5); continue; }
+        if (statusInt(st, s) && (s & BUSY)) { Command("stop", wait); sleepSeconds(0.5); continue; }
         break;
     }
     long s = 0;
@@ -111,19 +126,19 @@ void ZnF9020::ensureIdle(double wait) {
 // --------------------------------------------------------------------------- //
 // scanning / streaming
 // --------------------------------------------------------------------------- //
-bool ZnF9020::startScan() {
-    dup_log_ = 0; burst_cool_ = 0;           // fresh per-scan diagnostics
-    fprintf(stderr, "# version: %.80s ...\n", command("version").c_str());
-    ensureIdle();
-    sleep_s(0.5);
-    fprintf(stderr, "# scan reply: %s\n", command(scan_cmd_).c_str());
-    scanning_ = true;
-    for (int i = 0; i < 10 && !abort_.load(); ++i) { // auto-answer overwrite/messagebox
-        sleep_s(0.5);
-        std::string st = command("status");
+bool ZnF9020::StartScan() {
+    m_dupLog = 0; m_burstCool = 0;           // fresh per-scan diagnostics
+    fprintf(stderr, "# version: %.80s ...\n", Command("version").c_str());
+    EnsureIdle();
+    sleepSeconds(0.5);
+    fprintf(stderr, "# scan reply: %s\n", Command(m_scanCmd).c_str());
+    m_scanning = true;
+    for (int i = 0; i < 10 && !m_abort.load(); ++i) { // auto-answer overwrite/messagebox
+        sleepSeconds(0.5);
+        std::string st = Command("status");
         if (st.find("<messagebox") != std::string::npos) {
             fprintf(stderr, "# messagebox -> answering '%s'\n", affirmative(st).c_str());
-            command(affirmative(st));
+            Command(affirmative(st));
             continue;
         }
         long s = 0;
@@ -131,28 +146,28 @@ bool ZnF9020::startScan() {
                 statusInt(st, s) ? statusStr(s).c_str() : st.c_str());
         break;
     }
-    double deadline = now_s() + 10;
-    while (stream_fd_ < 0 && now_s() < deadline && !abort_.load()) {
-        stream_fd_ = connectTcp(cfg_.ip, PORT_STREAM, 2.0);
-        if (stream_fd_ < 0) sleep_s(0.5);
+    double deadline = nowSeconds() + 10;
+    while (!m_streamFd.Valid() && nowSeconds() < deadline && !m_abort.load()) {
+        m_streamFd.Reset(connectTcp(m_cfg.ip, PORT_STREAM, 2.0));
+        if (!m_streamFd.Valid()) sleepSeconds(0.5);
     }
-    if (stream_fd_ < 0) { fprintf(stderr, "!! could not connect to stream port\n"); return false; }
-    int rcvbuf = 4 * 1024 * 1024;           // absorb GUI/X11 stalls without
-    setsockopt(stream_fd_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    if (!m_streamFd.Valid()) { fprintf(stderr, "!! could not connect to stream port\n"); return false; }
+    const int rcvbuf = 4 * 1024 * 1024;     // absorb GUI/X11 stalls without
+    setsockopt(m_streamFd.Get(), SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     return true;
 }
 
-void ZnF9020::streamFor(double seconds) {
-    if (stream_fd_ < 0) return;
+void ZnF9020::StreamFor(double seconds) {
+    if (!m_streamFd.Valid()) return;
     double t_s = 0.0; long line_no = -1;
     bool got_data = false;
-    double deadline = now_s() + seconds + 30.0;  // provisional: allow ~12 s spin-up
-    double last_stat = now_s();
+    double deadline = nowSeconds() + seconds + 30.0;  // provisional: allow ~12 s spin-up
+    double last_stat = nowSeconds();
     fprintf(stderr, "# waiting for scanner spin-up (data-invalid phase) ...\n");
     int err_streak = 0;                          // consecutive recoverable faults
-    while (now_s() < deadline && !abort_.load()) {
+    while (nowSeconds() < deadline && !m_abort.load()) {
         uint16_t type;
-        FrameRes fr = readFrame(type, payload_);
+        FrameRes fr = readFrame(type, m_payload);
         if (fr == FRAME_TIMEOUT) continue;
         if (fr == FRAME_ERR) {
             // single faults (device hiccup / mid-frame stall / desync) are
@@ -164,80 +179,80 @@ void ZnF9020::streamFor(double seconds) {
         err_streak = 0;
 
         if (type == ZFS_HEADER_ID) {
-            int p = parseHeaderPixel(payload_.data(), payload_.size());
+            int p = parseHeaderPixel(m_payload.data(), m_payload.size());
             if (p >= 1024 && p <= 32768 && p % 2 == 0) {
-                if (pixel_ > 0 && p != pixel_)
-                    fprintf(stderr, "# pixel/line changed %d -> %d\n", pixel_, p);
-                pixel_ = p;
-                fprintf(stderr, "# zfs header: pixel/line = %d\n", pixel_);
+                if (m_pixel > 0 && p != m_pixel)
+                    fprintf(stderr, "# pixel/line changed %d -> %d\n", m_pixel, p);
+                m_pixel = p;
+                fprintf(stderr, "# zfs header: pixel/line = %d\n", m_pixel);
             } else if (p > 0) {
                 fprintf(stderr, "# ignoring implausible pixel/line %d from header frame\n", p);
             }
         } else if (type == LINE_HEADER_ID) {
-            lineheader_ = payload_;
-            t_s     = (lineheader_.size() >= 32) ? rdU32(lineheader_.data() + 28) / 1000.0 : 0.0;
-            line_no = (lineheader_.size() >= 36) ? (long)rdU32(lineheader_.data() + 32) : -1;
+            m_lineHeader = m_payload;
+            t_s     = (m_lineHeader.size() >= 32) ? rdU32(m_lineHeader.data() + 28) / 1000.0 : 0.0;
+            line_no = (m_lineHeader.size() >= 36) ? (long)rdU32(m_lineHeader.data() + 32) : -1;
         } else if (type == RAW_PIXEL_ID || type == COMP_PIXEL_ID) {
-            const unsigned char* data = payload_.data();
-            size_t n = payload_.size();
+            const unsigned char* data = m_payload.data();
+            size_t n = m_payload.size();
             if (type == COMP_PIXEL_ID) {
-                n = inflateLine(payload_.data(), payload_.size(), inflated_);
-                data = inflated_.data();
+                n = inflateLine(m_payload.data(), m_payload.size(), m_inflated);
+                data = m_inflated.data();
                 if (n == 0) continue;
             }
-            if (pixel_ < 0) {                    // fallback from payload size,
+            if (m_pixel < 0) {                    // fallback from payload size,
                 int p = (int)(n / 8);            // same plausibility bounds
-                if (p >= 1024 && p <= 32768 && p % 2 == 0) pixel_ = p;
+                if (p >= 1024 && p <= 32768 && p % 2 == 0) m_pixel = p;
                 else continue;
             }
-            long li = (line_no >= 0) ? line_no : lines_;
-            long got = decodeProfile(data, n, t_s, (double)li * cfg_.spacing);
-            pts_ += got;
-            ++lines_;
+            long li = (line_no >= 0) ? line_no : m_lines;
+            long got = decodeProfile(data, n, t_s, (double)li * m_cfg.spacing);
+            m_pts += got;
+            ++m_lines;
             if (!got_data && got > 0) {
                 got_data = true;
-                deadline = now_s() + seconds;    // --seconds counts from first data
+                deadline = nowSeconds() + seconds;    // --seconds counts from first data
                 fprintf(stderr, "# first valid data - %.0f s acquisition window starts\n", seconds);
             }
         }
-        if (now_s() - last_stat >= 1.0) {
-            fprintf(stderr, "# ... %ld lines, %ld points\n", lines_, pts_);
-            last_stat = now_s();
+        if (nowSeconds() - last_stat >= 1.0) {
+            fprintf(stderr, "# ... %ld lines, %ld points\n", m_lines, m_pts);
+            last_stat = nowSeconds();
         }
     }
-    fprintf(stderr, "# acquired ~%ld lines, %ld points\n", lines_, pts_);
+    fprintf(stderr, "# acquired ~%ld lines, %ld points\n", m_lines, m_pts);
 }
 
-void ZnF9020::stop() {
-    if (scanning_ && cmd_fd_ >= 0)
-        fprintf(stderr, "# stop reply: %s\n", command("stop").c_str());
-    scanning_ = false;
+void ZnF9020::Stop() {
+    if (m_scanning && m_cmdFd.Valid())
+        fprintf(stderr, "# stop reply: %s\n", Command("stop").c_str());
+    m_scanning = false;
 }
 
-void ZnF9020::disconnect() {
-    if (stream_fd_ >= 0) { close(stream_fd_); stream_fd_ = -1; }
-    if (cmd_fd_ >= 0)    { close(cmd_fd_);    cmd_fd_ = -1; }
+void ZnF9020::Disconnect() {
+    m_streamFd.Reset();
+    m_cmdFd.Reset();
 }
 
 // --------------------------------------------------------------------------- //
 // scan-command building, framing, decode
 // --------------------------------------------------------------------------- //
 std::string ZnF9020::buildScanCommand() const {
-    if (!cfg_.scan_args.empty()) return "scan " + cfg_.scan_args;
-    std::string fname = cfg_.file;
+    if (!m_cfg.scan_args.empty()) return "scan " + m_cfg.scan_args;
+    std::string fname = m_cfg.file;
     if (fname.empty()) {
         char ts[32]; time_t t = time(nullptr); tm lt; localtime_r(&t, &lt);
         strftime(ts, sizeof(ts), "live_%Y%m%d-%H%M%S", &lt);
         fname = ts;
     }
-    std::string cmd = "scan -profiler -resolution " + cfg_.resolution +
-                      " -quality " + cfg_.quality + " -file " + fname +
-                      " -path scans -filesize 250mb -linestream " + cfg_.mode +
-                      " -statusstream -memorize 3 -writing 0 -ip " + local_;
+    std::string cmd = "scan -profiler -resolution " + m_cfg.resolution +
+                      " -quality " + m_cfg.quality + " -file " + fname +
+                      " -path scans -filesize 250mb -linestream " + m_cfg.mode +
+                      " -statusstream -memorize 3 -writing 0 -ip " + m_local;
     char num[64];
-    if (cfg_.has_rps) { snprintf(num, sizeof(num), " %s %g", RPS_FLAG, cfg_.rps); cmd += num; }
-    if (cfg_.has_mhz) { snprintf(num, sizeof(num), " %s %g", MHZ_FLAG, cfg_.mhz); cmd += num; }
-    if (!cfg_.extra.empty()) cmd += " " + cfg_.extra;
+    if (m_cfg.has_rps) { snprintf(num, sizeof(num), " %s %g", RPS_FLAG, m_cfg.rps); cmd += num; }
+    if (m_cfg.has_mhz) { snprintf(num, sizeof(num), " %s %g", MHZ_FLAG, m_cfg.mhz); cmd += num; }
+    if (!m_cfg.extra.empty()) cmd += " " + m_cfg.extra;
     return cmd;
 }
 
@@ -250,17 +265,17 @@ ZnF9020::FrameRes ZnF9020::readFrame(uint16_t& type, std::vector<unsigned char>&
     static constexpr uint32_t MAX_FRAME_BYTES = 4u << 20; // legit < ~1 MiB
     static constexpr long     MAX_SCAN_BYTES  = 4L << 20; // bound marker hunt
     unsigned char m[4];
-    if (!recvExact(stream_fd_, m, 4, MARKER_TIMEOUT_S)) return FRAME_TIMEOUT;
+    if (!recvExact(m_streamFd.Get(),m, 4, MARKER_TIMEOUT_S)) return FRAME_TIMEOUT;
     long scanned = 0;
     while (!(m[0]=='Z' && m[1]=='+' && m[2]=='F' && m[3]==0)) {      // resync to marker
         m[0]=m[1]; m[1]=m[2]; m[2]=m[3];
-        if (!recvExact(stream_fd_, &m[3], 1, MARKER_TIMEOUT_S)) return FRAME_TIMEOUT;
+        if (!recvExact(m_streamFd.Get(),&m[3], 1, MARKER_TIMEOUT_S)) return FRAME_TIMEOUT;
         if (++scanned > MAX_SCAN_BYTES) return FRAME_ERR; // let caller breathe
     }
     if (scanned)
         fprintf(stderr, "# stream resync: %ld bytes skipped to next frame marker\n", scanned);
     unsigned char h[10];
-    if (!recvExact(stream_fd_, h, 10, FRAME_IDLE_TIMEOUT_S)) return FRAME_ERR;
+    if (!recvExact(m_streamFd.Get(),h, 10, FRAME_IDLE_TIMEOUT_S)) return FRAME_ERR;
     type = (uint16_t)(h[0] | (h[1] << 8));
     uint32_t size = (uint32_t)h[2] | ((uint32_t)h[3]<<8) | ((uint32_t)h[4]<<16) | ((uint32_t)h[5]<<24);
     if (size > MAX_FRAME_BYTES) {
@@ -269,13 +284,13 @@ ZnF9020::FrameRes ZnF9020::readFrame(uint16_t& type, std::vector<unsigned char>&
         return FRAME_ERR;                            // recoverable: rescan next call
     }
     payload.resize(size);
-    if (size && !recvExact(stream_fd_, payload.data(), size, FRAME_IDLE_TIMEOUT_S)) return FRAME_ERR;
+    if (size && !recvExact(m_streamFd.Get(),payload.data(), size, FRAME_IDLE_TIMEOUT_S)) return FRAME_ERR;
     return FRAME_OK;
 }
 
 long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, double x) {
     const uint16_t* u = (const uint16_t*)data;       // host is LE
-    if (pixel_ <= 0 || n < (size_t)pixel_ * 8) return 0;
+    if (m_pixel <= 0 || n < (size_t)m_pixel * 8) return 0;
     // ABSOLUTE PER-PIXEL DECODE (discovered 2026-06-12). Live tcpzip layout,
     // all values byte-doubled coarse (high byte duplicated into low):
     //   plane0[half+j]  range modulo 6.5536 m      (x 0.1 mm, ~25.7 mm steps)
@@ -305,12 +320,12 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
                                                   // seen live 2026-06-12
     static constexpr int    PARKED_NB  = 4;       // +/- neighbours checked
     static constexpr int    PARKED_MIN = 3;       // exact repeats => parked
-    const int dirs = pixel_ / 2;
+    const int dirs = m_pixel / 2;
     const uint16_t* pf = u + dirs;                // plane0: range mod 6.5536
-    const uint16_t* pk = u + pixel_;              // plane1 first half: k
-    const uint16_t* pa = u + pixel_ + dirs;       // plane1 second half: amp
-    const uint16_t* pc = u + 2 * pixel_;          // plane2: secondary
-    const double rot = cfg_.rotate_deg * M_PI / 180.0;
+    const uint16_t* pk = u + m_pixel;              // plane1 first half: k
+    const uint16_t* pa = u + m_pixel + dirs;       // plane1 second half: amp
+    const uint16_t* pc = u + 2 * m_pixel;          // plane2: secondary
+    const double rot = m_cfg.rotate_deg * M_PI / 180.0;
     auto dup = [](uint16_t v) { return (v & 0xFF) == (v >> 8); };
 
     {
@@ -327,10 +342,10 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
             if (v > modal) modal = v;
         }
         if (100 * modal > 15 * dirs) {
-            if ((dup_log_++ % 50) == 0)
+            if ((m_dupLog++ % 50) == 0)
                 fprintf(stderr, "# device no-return burst dropped "
                         "(modal fine %d%% of line)\n", 100 * modal / dirs);
-            burst_cool_ = 3;                 // also skip the garbled exit lines
+            m_burstCool = 3;                 // also skip the garbled exit lines
             return 0;
         }
         // WRAP-COUNTER INTEGRITY: plane1[j] is byte-doubled in every healthy
@@ -343,13 +358,13 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
             if (labs((long)pk[j] - kk * 257) > 1) ++kbad;
         }
         if (20 * kbad > dirs) {              // >5% broken = channel upset
-            if ((dup_log_++ % 50) == 0)
+            if ((m_dupLog++ % 50) == 0)
                 fprintf(stderr, "# wrap-counter channel upset dropped "
                         "(%d/%d px invalid)\n", kbad, dirs);
-            burst_cool_ = 3;
+            m_burstCool = 3;
             return 0;
         }
-        if (burst_cool_ > 0) { --burst_cool_; return 0; }
+        if (m_burstCool > 0) { --m_burstCool; return 0; }
     }
 
     // single pass: absolute range per pixel + validity
@@ -358,16 +373,16 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
     for (int j = 0; j < dirs; ++j) {
         abuf[j] = pa[j];
         if (dup(pf[j]) && pc[j] == pf[j]) continue;  // no-return status pixel
-        if (abuf[j] <= cfg_.min_amp) continue;
+        if (abuf[j] <= m_cfg.min_amp) continue;
         double fine = pf[j] * RANGE_SCALE_M;
         long   k    = lround(pk[j] / 257.0);         // byte-doubled wrap count
         if (labs((long)pk[j] - k * 257) > 1) continue; // invalid k encoding
-        if (!cfg_.unwrap) k = 0;                     // fold display (debug)
+        if (!m_cfg.unwrap) k = 0;                     // fold display (debug)
         if (k == 0 && fine < SENTINEL_M) continue;   // window sentinel
         double r = fine + (double)k * AMBIG_M;
         if (r > R_MAX_M) continue;                   // beyond spec = junk
-        if (r < cfg_.min_range_m) continue;
-        if (cfg_.unwrap) {
+        if (r < m_cfg.min_range_m) continue;
+        if (m_cfg.unwrap) {
             // plane2 sanity: when it MEASURES (parked codes exactly repeat
             // across neighbours; real values jitter), it must agree with r
             // modulo its own interval, else the pixel is a mixed echo
@@ -394,11 +409,11 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
     // surface seen at grazing incidence, e.g. the far floor, is also chord-
     // radial but spans far more pixels than a spot-size-bounded edge trail).
     std::vector<unsigned char> drop(dirs, 0);
-    if (cfg_.mixpix_deg > 0.0) {
+    if (m_cfg.mixpix_deg > 0.0) {
         static constexpr int MIX_RUN_EXEMPT = 32;    // px span = real surface
         static constexpr int MIX_RUN_GAP    = 8;     // px joining run members
         const int W = 4;
-        const double cosT = std::cos(cfg_.mixpix_deg * M_PI / 180.0);
+        const double cosT = std::cos(m_cfg.mixpix_deg * M_PI / 180.0);
         std::vector<unsigned char> flag(dirs, 0);
         for (int j = W; j < dirs - W; ++j) {
             if (!ok[j] || !ok[j - W] || !ok[j + W]) continue;
@@ -437,21 +452,21 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
     }
 
     // pass 3: emit with stride
-    int every = cfg_.print_every > 0 ? cfg_.print_every : 1;
+    int every = m_cfg.print_every > 0 ? m_cfg.print_every : 1;
     long cnt = 0;
     std::vector<float> ys, zs, is;
     for (int j = 0; j < dirs; j += every) {
         if (!ok[j] || drop[j]) continue;
         double ang = 2.0 * M_PI * (double)j / (double)dirs + rot;
         double yy = -rbuf[j] * std::cos(ang), zz = -rbuf[j] * std::sin(ang);
-        if (on_profile_) {
+        if (m_onProfile) {
             ys.push_back((float)yy); zs.push_back((float)zz); is.push_back((float)abuf[j]);
         } else {
             printf("%9.3f %9.3f %9.3f %9.3f %9.0f\n", t_s, x, yy, zz, abuf[j]);
         }
         ++cnt;
     }
-    if (on_profile_ && cnt) on_profile_(t_s, ys, zs, is);
+    if (m_onProfile && cnt) m_onProfile(t_s, ys, zs, is);
     return cnt;
 }
 
@@ -497,13 +512,13 @@ bool ZnF9020::recvExact(int fd, void* buf, size_t n, double idle_timeout_s) {
 // write all bytes to a non-blocking fd within an overall deadline.
 bool ZnF9020::sendAll(int fd, const std::string& s, double timeout_s) {
     size_t sent = 0;
-    const double deadline = now_s() + timeout_s;
+    const double deadline = nowSeconds() + timeout_s;
     while (sent < s.size()) {
         ssize_t r = send(fd, s.data() + sent, s.size() - sent, MSG_NOSIGNAL);
         if (r > 0) { sent += (size_t)r; continue; }
         if (r < 0 && errno == EINTR) continue;
         if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            const double left = deadline - now_s();
+            const double left = deadline - nowSeconds();
             if (left <= 0.0 || !waitFd(fd, POLLOUT, left)) return false;
             continue;
         }
@@ -565,15 +580,23 @@ int ZnF9020::parseHeaderPixel(const unsigned char* d, size_t n) {
 }
 
 size_t ZnF9020::inflateLine(const unsigned char* in, size_t inlen, std::vector<unsigned char>& out) {
-    z_stream zs{};
-    if (inflateInit2(&zs, 15) != Z_OK) return 0;
+    // RAII: inflateEnd() bound to scope, so no exit path can leak the stream
+    struct InflateStream {
+        z_stream zs{};
+        const bool ok;
+        InflateStream() : ok(inflateInit2(&zs, 15) == Z_OK) {}
+        ~InflateStream() { if (ok) inflateEnd(&zs); }
+        InflateStream(const InflateStream&)            = delete;
+        InflateStream& operator=(const InflateStream&) = delete;
+        InflateStream(InflateStream&&)                 = delete;
+        InflateStream& operator=(InflateStream&&)      = delete;
+    } z;
+    if (!z.ok) return 0;
     if (out.size() < (1u << 20)) out.resize(1u << 20);
-    zs.next_in = (Bytef*)in; zs.avail_in = (uInt)inlen;
-    zs.next_out = out.data(); zs.avail_out = (uInt)out.size();
-    inflate(&zs, Z_SYNC_FLUSH);
-    size_t produced = zs.total_out;
-    inflateEnd(&zs);
-    return produced;
+    z.zs.next_in = (Bytef*)in; z.zs.avail_in = (uInt)inlen;
+    z.zs.next_out = out.data(); z.zs.avail_out = (uInt)out.size();
+    inflate(&z.zs, Z_SYNC_FLUSH);
+    return z.zs.total_out;
 }
 
 bool ZnF9020::statusInt(const std::string& xml, long& out) {

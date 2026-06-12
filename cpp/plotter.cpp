@@ -18,12 +18,6 @@
 // Each Start runs a fresh ZnF9020 session on a worker thread (profile callback
 // feeds a shared buffer); the main thread owns the X11 event loop and redraws
 // at --fps. Closing the window mid-scan stops the scan cleanly first.
-#include "ZnF9020.h"
-
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/keysym.h>
-
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -37,6 +31,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/keysym.h>
+
+#include "ZnF9020.h"
 
 struct Profile {
     double t;
@@ -78,7 +78,7 @@ static void usage() {
         "  --local-ip IP      override local IP advertised to scanner\n");
 }
 
-static bool parse_args(int argc, char** argv, ZnF9020::Config& c, PlotArgs& p) {
+static bool parseArgs(int argc, char** argv, ZnF9020::Config& c, PlotArgs& p) {
     c.print_every = 1;                      // plotter default: every pixel
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
@@ -149,22 +149,54 @@ struct Btn {
     }
 };
 
+// RAII owner of every X11 resource main() creates; the destructor releases
+// them in reverse creation order, so no exit path needs manual XFree calls.
+struct XSession {
+    Display*     dpy  = nullptr;
+    Window       win  = 0;
+    GC           gc   = nullptr;
+    XFontStruct* font = nullptr;
+    Pixmap       pm   = 0;
+
+    XSession() = default;
+    ~XSession() {
+        if (!dpy) return;
+        if (pm)   XFreePixmap(dpy, pm);
+        if (font) XFreeFont(dpy, font);
+        if (gc)   XFreeGC(dpy, gc);
+        if (win)  XDestroyWindow(dpy, win);
+        XCloseDisplay(dpy);
+    }
+    XSession(const XSession&)            = delete;
+    XSession& operator=(const XSession&) = delete;
+    XSession(XSession&&)                 = delete;
+    XSession& operator=(XSession&&)      = delete;
+
+    void ResizePixmap(int w, int h, int depth) {
+        if (pm) XFreePixmap(dpy, pm);
+        pm = XCreatePixmap(dpy, win, (unsigned)w, (unsigned)h, (unsigned)depth);
+    }
+};
+
 int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
     ZnF9020::Config cfg;
     PlotArgs pa;
-    if (!parse_args(argc, argv, cfg, pa)) { usage(); return 2; }
+    if (!parseArgs(argc, argv, cfg, pa)) { usage(); return 2; }
 
-    Display* dpy = XOpenDisplay(nullptr);
-    if (!dpy) {
+    XSession x;                             // RAII owner of all X11 resources
+    x.dpy = XOpenDisplay(nullptr);
+    if (!x.dpy) {
         fprintf(stderr, "Cannot open X display - run on a desktop session "
                         "(DISPLAY set), or use ./acquire for text output.\n");
         return 1;
     }
-    int scr = DefaultScreen(dpy);
+    Display* const dpy = x.dpy;             // non-owning aliases for draw code
+    const int scr = DefaultScreen(dpy);
     int W = 840, H = 840;
-    Window win = XCreateSimpleWindow(dpy, RootWindow(dpy, scr), 0, 0, W, H, 0,
-                                     BlackPixel(dpy, scr), BlackPixel(dpy, scr));
+    x.win = XCreateSimpleWindow(dpy, RootWindow(dpy, scr), 0, 0, W, H, 0,
+                                BlackPixel(dpy, scr), BlackPixel(dpy, scr));
+    const Window win = x.win;
     XSelectInput(dpy, win,
                  StructureNotifyMask | KeyPressMask | ExposureMask | ButtonPressMask);
     Atom wmDelete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
@@ -172,11 +204,14 @@ int main(int argc, char** argv) {
     XStoreName(dpy, win, pa.timed ? "AutoMap + GeoMetra's Z+F live Y-Z - connecting ..."
                                   : "AutoMap + GeoMetra's Z+F live Y-Z - press Start");
     XMapWindow(dpy, win);
-    GC gc = XCreateGC(dpy, win, 0, nullptr);
-    XFontStruct* font = XLoadQueryFont(dpy, "fixed");   // for labels
+    x.gc = XCreateGC(dpy, win, 0, nullptr);
+    const GC gc = x.gc;
+    x.font = XLoadQueryFont(dpy, "fixed");  // for labels
+    XFontStruct* const font = x.font;
     if (font) XSetFont(dpy, gc, font->fid);
-    int depth = DefaultDepth(dpy, scr);
-    Pixmap pm = XCreatePixmap(dpy, win, W, H, depth);
+    const int depth = DefaultDepth(dpy, scr);
+    x.ResizePixmap(W, H, depth);
+    const Pixmap& pm = x.pm;                // tracks recreation on resize
     XFlush(dpy);
 
     // ---- shared profile buffer fed by the scanner worker thread ----------- //
@@ -197,7 +232,7 @@ int main(int argc, char** argv) {
 
     // ---- session management (one fresh ZnF9020 per Start) ----------------- //
     std::unique_ptr<ZnF9020> scanner;
-    std::thread worker;
+    std::jthread worker;                    // RAII: joins on destruction
     bool running = false;
     long sessions = 0;
     int  rc = 0;
@@ -212,9 +247,9 @@ int main(int argc, char** argv) {
         nprof = 0; npts = 0; ext = 0.5;
         session_done = false;
         scanner = std::make_unique<ZnF9020>(cfg);
-        scanner->setProfileCallback(onProfile);
-        worker = std::thread([&] {
-            session_ok = scanner->start();
+        scanner->SetProfileCallback(onProfile);
+        worker = std::jthread([&] {
+            session_ok = scanner->Start();
             session_done = true;
         });
         running = true;
@@ -222,7 +257,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "# session %ld started\n", sessions);
     };
     auto stopSession = [&]() {              // graceful: worker reaps via session_done
-        if (running && scanner) scanner->requestStop();
+        if (running && scanner) scanner->RequestStop();
     };
 
     if (pa.timed) startSession();           // timed mode auto-starts
@@ -256,8 +291,7 @@ int main(int argc, char** argv) {
                        (ev.xconfigure.width != W || ev.xconfigure.height != H)) {
                 W = ev.xconfigure.width;
                 H = ev.xconfigure.height;
-                XFreePixmap(dpy, pm);
-                pm = XCreatePixmap(dpy, win, W, H, depth);
+                x.ResizePixmap(W, H, depth);
             }
         }
         if (user_closed) break;
@@ -458,7 +492,7 @@ int main(int argc, char** argv) {
     // wind down: stop a running scan, join the worker
     if (user_closed && running)
         fprintf(stderr, "# window closed - stopping scan\n");
-    if (scanner) scanner->requestStop();
+    if (scanner) scanner->RequestStop();
     if (worker.joinable()) worker.join();
     if (scanner) { rc = session_ok ? 0 : 1; scanner.reset(); }
 
@@ -471,12 +505,7 @@ int main(int argc, char** argv) {
         XFlush(dpy);
         std::this_thread::sleep_for(std::chrono::milliseconds(600));
     }
-    XFreePixmap(dpy, pm);
-    if (font) XFreeFont(dpy, font);
-    XFreeGC(dpy, gc);
-    XDestroyWindow(dpy, win);
-    XCloseDisplay(dpy);
     fprintf(stderr, "# done: %ld session(s), last: %ld profiles, %ld points\n",
             sessions, nprof.load(), npts.load());
-    return rc;
+    return rc;                              // XSession dtor frees X11 resources
 }

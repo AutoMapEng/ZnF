@@ -50,38 +50,63 @@ public:
     };
 
     explicit ZnF9020(const Config& cfg);
-    ~ZnF9020();                              // RAII: stop() + disconnect()
+    ~ZnF9020();                              // RAII: Stop() + Disconnect()
+
+    // Non-copyable, non-movable: the object owns the socket fds and is shared
+    // by address with a worker thread; copies/moves would alias the session.
+    ZnF9020(const ZnF9020&)            = delete;
+    ZnF9020& operator=(const ZnF9020&) = delete;
+    ZnF9020(ZnF9020&&)                 = delete;
+    ZnF9020& operator=(ZnF9020&&)      = delete;
 
     // High-level: connect, start scanning, stream for cfg.seconds, then stop.
-    bool start();
+    bool Start();
 
     // Lower-level control interface (usable individually):
-    bool        connect();                              // open command channel (6100)
-    std::string command(const std::string& text, double wait = 2.5);  // send + read XML
-    void        ensureIdle(double wait = 2.5);          // answer boxes / stop running scan
-    bool        startScan();                            // send scan cmd, open data stream
-    void        streamFor(double seconds);              // read frames -> print points
-    void        stop();                                 // stop the scan   (idempotent)
-    void        disconnect();                            // close sockets   (idempotent)
+    bool        Connect();                              // open command channel (6100)
+    std::string Command(const std::string& text, double wait = 2.5);  // send + read XML
+    void        EnsureIdle(double wait = 2.5);          // answer boxes / stop running scan
+    bool        StartScan();                            // send scan cmd, open data stream
+    void        StreamFor(double seconds);              // read frames -> print points
+    void        Stop();                                 // stop the scan   (idempotent)
+    void        Disconnect();                            // close sockets   (idempotent)
 
-    long lines() const { return lines_; }
-    long points() const { return pts_; }
+    [[nodiscard]] long Lines()  const noexcept { return m_lines; }
+    [[nodiscard]] long Points() const noexcept { return m_pts; }
 
     // Per-profile callback: when set, decoded points (y,z = cross-section [m],
     // inten = raw amplitude) are delivered here INSTEAD of printed to stdout.
-    // Called from the thread running start()/streamFor().
+    // Called from the thread running Start()/StreamFor().
     using ProfileCallback = std::function<void(double t_s,
                                                const std::vector<float>& y,
                                                const std::vector<float>& z,
                                                const std::vector<float>& inten)>;
-    void setProfileCallback(ProfileCallback cb) { on_profile_ = std::move(cb); }
+    void SetProfileCallback(ProfileCallback cb) { m_onProfile = std::move(cb); }
 
-    // Thread-safe: ask a running start()/streamFor() (e.g. on a worker thread)
+    // Thread-safe: ask a running Start()/StreamFor() (e.g. on a worker thread)
     // to wind down early; it reacts within ~1 s and stops the scan as usual.
-    void requestStop() { abort_.store(true); }
+    void RequestStop() { m_abort.store(true); }
 
 private:
-    // protocol constants (C++17 inline static constexpr)
+    // RAII owner of a POSIX socket fd: closes on destruction / Reset(), so no
+    // path can leak or double-close a descriptor. Movable, not copyable.
+    class UniqueFd {
+    public:
+        UniqueFd() = default;
+        explicit UniqueFd(int fd) noexcept : m_fd(fd) {}
+        ~UniqueFd();
+        UniqueFd(const UniqueFd&)            = delete;
+        UniqueFd& operator=(const UniqueFd&) = delete;
+        UniqueFd(UniqueFd&& o) noexcept : m_fd(o.m_fd) { o.m_fd = -1; }
+        UniqueFd& operator=(UniqueFd&& o) noexcept;
+        [[nodiscard]] int  Get()   const noexcept { return m_fd; }
+        [[nodiscard]] bool Valid() const noexcept { return m_fd >= 0; }
+        void Reset(int fd = -1) noexcept;    // close current, adopt fd
+    private:
+        int m_fd = -1;
+    };
+
+    // protocol constants (inline static constexpr)
     static constexpr int    PORT_COMMAND   = 6100;
     static constexpr int    PORT_STREAM    = 6105;
     static constexpr double RANGE_SCALE_M  = 0.0001;    // 1/10 mm raw range unit (SDK)
@@ -90,18 +115,18 @@ private:
     enum { ZFS_HEADER_ID = 4, LINE_HEADER_ID = 3, RAW_PIXEL_ID = 6, COMP_PIXEL_ID = 7 };
     enum FrameRes { FRAME_OK, FRAME_TIMEOUT, FRAME_ERR };
 
-    Config cfg_;
-    std::string local_, scan_cmd_;
-    int  cmd_fd_ = -1, stream_fd_ = -1;
-    bool scanning_ = false;
-    int  pixel_ = -1;
-    long lines_ = 0, pts_ = 0;
-    std::vector<unsigned char> payload_, inflated_, lineheader_;
-    long dup_log_ = 0;            // rate-limit dropped-line log messages
-    int  burst_cool_ = 0;         // garbled exit lines after a no-return burst
+    Config m_cfg;
+    std::string m_local, m_scanCmd;
+    UniqueFd m_cmdFd, m_streamFd;
+    bool m_scanning = false;
+    int  m_pixel = -1;
+    long m_lines = 0, m_pts = 0;
+    std::vector<unsigned char> m_payload, m_inflated, m_lineHeader;
+    long m_dupLog = 0;            // rate-limit dropped-line log messages
+    int  m_burstCool = 0;         // garbled exit lines after a no-return burst
 
-    ProfileCallback   on_profile_;
-    std::atomic<bool> abort_{false};
+    ProfileCallback   m_onProfile;
+    std::atomic<bool> m_abort{false};
 
     std::string buildScanCommand() const;
     FrameRes    readFrame(uint16_t& type, std::vector<unsigned char>& payload);
