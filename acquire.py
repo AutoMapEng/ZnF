@@ -141,17 +141,36 @@ def decode_dual(u, pixel, unwrap=True, prev_sec=None, min_amp=2000.0, min_range=
     interval. No-return STATUS pixels: duplicated-byte code in plane0 AND
     plane2 == the same raw value. unwrap=False ignores k (fold display).
     prev_sec accepted for API compat (unused).
+
+    NEAR-FIELD OVERLOAD (hand <30 cm; characterized from a raw capture
+    2026-06-12): upset directions emit byte-soup, not measurements -
+      * during the event, plane1 carries byte-doubled garbage codes (0x0505,
+        0x1515, ...) that decode as valid k -> constant-radius ARCS at 38 /
+        94 / 144 / 177 m, interleaved with mixed-byte (invalid-k) pixels;
+      * after the event the directions stay PARKED for the rest of the scan
+        at ~181.3-182 m with FROZEN amplitude (one byte-doubled code value,
+        e.g. 0xB4B4, repeated +/- low-byte soup) - the "saturation scar".
+    Two per-pixel gates remove both (measured: 99.6% of artifacts, 0.0015%
+    genuine loss) so R_MAX is the full 182.68 m spec, not a band cut:
+      AMP-PARK   amplitude exactly repeats >=3 times among +-4 neighbours
+                 (>=2 if the value is byte-doubled): genuine amplitude
+                 jitters; a frozen value marks a parked/scarred direction.
+      UPSET-NEIGHBOURHOOD   a wrap claim (k>=1) within +-8 px of corruption
+                 evidence (invalid-k pixel or amp-park) is garbage from the
+                 same upset sector. k=0 pixels are unaffected; genuine far
+                 returns sit in clean neighbourhoods and keep their k.
     Returns (r_metres, amp, sec); invalid -> r=0."""
     SEC_MOD_M, SEC_MIN_M, SEC_VETO_M = 13.1072, 0.40, 2.5
     PARKED_MIN = 3
-    R_MAX_M = 181.0              # spec 182.68 m (tag 50); top ~1.7 m = device
-                                 # SATURATION-SCAR band (near-field overload
-                                 # parks upset directions at max range, frozen
-                                 # amp, for the rest of the scan)
+    R_MAX_M = 182.68             # full spec range (ZFS header tag 50)
+    AMP_PARK_MIN = 3             # exact amp repeats in +-4 => parked direction
+    AMP_PARK_DUP_MIN = 2         # byte-doubled amp value needs only 2 (soup edges)
+    UPSET_NB = 8                 # corruption-evidence influence radius [px]
     half = pixel // 2
     fraw = u[half:pixel].astype(np.int64)
     kraw = u[pixel:pixel + half].astype(np.int64)
-    amp  = u[pixel + half:2 * pixel].astype(np.float64)
+    ampi = u[pixel + half:2 * pixel].astype(np.int64)
+    amp  = ampi.astype(np.float64)
     sraw = u[2 * pixel:2 * pixel + half].astype(np.int64)
     sec  = sraw.astype(np.float64) * 2 * RANGE_SCALE_M
     # DEVICE RECALIBRATION BURST (~41 s in, ~60 lines): plane0 collapses to
@@ -178,7 +197,20 @@ def decode_dual(u, pixel, unwrap=True, prev_sec=None, min_amp=2000.0, min_range=
     if not unwrap:
         k = np.zeros_like(k)
     r = fine + k * AMBIG_M
+    # AMP-PARK: frozen amplitude = parked/scarred direction (genuine jitters)
+    ampprk = np.zeros(half, dtype=np.int64)
+    for off in (-4, -3, -2, -1, 1, 2, 3, 4):
+        ampprk += (ampi == np.roll(ampi, off))
+    ampdup = (ampi & 0xFF) == (ampi >> 8)
+    amppark = (ampprk >= AMP_PARK_MIN) | (ampdup & (ampprk >= AMP_PARK_DUP_MIN))
+    # UPSET-NEIGHBOURHOOD: dilate corruption evidence (invalid k / amp-park)
+    ev = kbad | amppark
+    near_upset = ev.copy()
+    for off in range(1, UPSET_NB + 1):
+        near_upset |= np.roll(ev, off) | np.roll(ev, -off)
     ok = ((~code) & (~kbad) & (amp > min_amp)
+          & ~amppark                                 # saturation scar / park
+          & ~((k >= 1) & near_upset)                 # wrap claim in upset sector
           & ~((k == 0) & (fine < SENTINEL_MIN_R))    # window sentinel
           & (r <= R_MAX_M) & (r >= min_range))
     if unwrap:
@@ -577,6 +609,71 @@ def iter_profiles(ip, seconds=30.0, mode="tcpzip", resolution="10000", quality="
         cmd.close()
 
 
+REC_MAGIC = b"ZNFREC1\n"
+
+
+def record_frames_iter(path):
+    """Yield (ptype, payload) frames from a --record capture file."""
+    with open(path, "rb") as f:
+        if f.read(len(REC_MAGIC)) != REC_MAGIC:
+            sys.exit(f"!! {path}: not a ZNFREC1 capture")
+        while True:
+            hdr = f.read(6)
+            if len(hdr) < 6:
+                return
+            ptype, size = struct.unpack("<HI", hdr)
+            payload = f.read(size)
+            if len(payload) < size:
+                return
+            yield ptype, payload
+
+
+def replay_file(args):
+    """Offline decode of a --record capture through the SAME pipeline as live."""
+    lines = pts = 0
+    pixel = None
+    cur_lh = b""
+    prev_sec_main = None
+    decode_reset()
+    print("# t[s]      x[m]      y[m]      z[m]   intensity")
+    for ptype, payload in record_frames_iter(args.replay):
+        if ptype == ZFS_HEADER_ID:
+            p = parse_zfs_header_pixel(payload)
+            if p:
+                pixel = p
+                print(f"# zfs header: pixel/line = {pixel}", file=sys.stderr)
+        elif ptype == LINE_HEADER_ID:
+            cur_lh = payload
+        elif ptype in (RAW_PIXEL_ID, COMP_PIXEL_ID):
+            data = payload
+            if ptype == COMP_PIXEL_ID:
+                try:
+                    d = zlib.decompressobj(15)
+                    data = d.decompress(payload) + d.flush()
+                except zlib.error:
+                    continue
+            if pixel is None:
+                pixel = len(data) // 8
+            t_s = lineheader_time_ms(cur_lh) / 1000.0
+            line_idx = lineheader_number(cur_lh)
+            if line_idx < 0:
+                line_idx = lines
+            for (t, x, y, z, inten) in decode_line(
+                    data, pixel, line_idx, t_s, args.spacing,
+                    args.min_amplitude, args.print_every,
+                    rot_deg=args.rotate_deg, min_range=args.min_range,
+                    unwrap=not args.no_unwrap, mixpix_deg=args.mixpix_deg,
+                    prev_sec=prev_sec_main):
+                print(f"{t:9.3f} {x:9.3f} {y:9.3f} {z:9.3f} {inten:9.0f}")
+                pts += 1
+            _u = np.frombuffer(data, dtype="<u2")
+            if pixel and _u.size >= 4 * pixel:
+                prev_sec_main = _u[2*pixel:2*pixel + pixel//2].astype(np.float64) * 2 * RANGE_SCALE_M
+            lines += 1
+    print(f"# replayed {lines} lines, printed {pts} points", file=sys.stderr)
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
@@ -636,7 +733,17 @@ def main():
     ap.add_argument("--print-every", type=int, default=2048,
                     help="print every Nth valid pixel per line to keep console readable (default 2048)")
     ap.add_argument("--local-ip", default=None, help="override local IP advertised to scanner")
+    ap.add_argument("--record", default=None, metavar="FILE",
+                    help="diagnostic: dump every stream frame verbatim (compressed payloads "
+                         "as received) to FILE for offline analysis / --replay")
+    ap.add_argument("--replay", default=None, metavar="FILE",
+                    help="diagnostic: decode a --record file offline through the identical "
+                         "pipeline instead of connecting to a scanner (ip ignored)")
     args = ap.parse_args()
+
+    # ---- offline replay of a --record capture (no scanner needed) --------- #
+    if args.replay is not None:
+        return replay_file(args)
 
     # ---- subnet discovery (no scanner IP needed) ------------------------- #
     if args.find:
@@ -700,6 +807,11 @@ def main():
     started = False
     lines = pts = 0
     pixel = None
+    rec_fp = None
+    if args.record:
+        rec_fp = open(args.record, "wb")
+        rec_fp.write(REC_MAGIC)
+        print(f"# recording every stream frame to {args.record}", file=sys.stderr)
     decode_reset()                                # fresh temporal state per scan
     try:
         report(cmd, "version", "version", args.reply_wait)
@@ -752,6 +864,9 @@ def main():
                 print(f"!! stream error: {e}", file=sys.stderr)
                 break
 
+            if rec_fp:
+                rec_fp.write(struct.pack("<HI", ptype, len(payload)) + payload)
+
             if ptype == ZFS_HEADER_ID:
                 p = parse_zfs_header_pixel(payload)
                 if p:
@@ -802,6 +917,8 @@ def main():
             pass
         if stream:
             stream.close()
+        if rec_fp:
+            rec_fp.close()
         cmd.close()
 
 

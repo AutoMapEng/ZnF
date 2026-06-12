@@ -308,18 +308,26 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
     static constexpr double SEC_MOD_M  = 13.1072; // plane2 own interval
     static constexpr double SEC_MIN_M  = 0.40;    // below this = code
     static constexpr double SEC_VETO_M = 2.5;     // mixed-echo disagreement
-    static constexpr double R_MAX_M    = 181.0;   // spec max range is 182.68 m
-                                                  // (ZFS header tag 50); the
-                                                  // top ~1.7 m is the device's
-                                                  // SATURATION-SCAR band: after
-                                                  // a near-field overload (hand
-                                                  // <30 cm) it parks the upset
-                                                  // directions at max range
-                                                  // (k=27, frozen amplitude)
-                                                  // for the REST OF THE SCAN -
-                                                  // seen live 2026-06-12
+    static constexpr double R_MAX_M    = 182.68;  // FULL spec range (tag 50)
+    // NEAR-FIELD OVERLOAD gates (characterized from a raw capture 2026-06-12;
+    // see acquire.py decode_dual and test_decode.py). A hand <30 cm upsets a
+    // sector of directions: during the event plane1 carries byte-doubled
+    // garbage codes that decode as valid k (constant-radius ARCS at 38/94/
+    // 144/177 m, interleaved with invalid-k pixels); afterwards the
+    // directions stay PARKED for the rest of the scan at ~181.3-182 m with a
+    // FROZEN amplitude code (e.g. 0xB4B4 +/- low-byte soup) - the
+    // "saturation scar". Genuine amplitude jitters and genuine lines carry
+    // ~zero invalid-k pixels, so two gates remove both artifact classes
+    // (measured 99.6% catch, 0.0015% genuine loss) WITHOUT a range band cut:
+    //   AMP-PARK  amplitude exactly repeats >= AMP_PARK_MIN among +-4 px
+    //             (>= AMP_PARK_DUP_MIN if the value is byte-doubled);
+    //   UPSET     a wrap claim (k>=1) within +-UPSET_NB px of corruption
+    //             evidence (invalid-k pixel or amp-park) is sector garbage.
     static constexpr int    PARKED_NB  = 4;       // +/- neighbours checked
     static constexpr int    PARKED_MIN = 3;       // exact repeats => parked
+    static constexpr int    AMP_PARK_MIN     = 3; // amp exact repeats in +-4
+    static constexpr int    AMP_PARK_DUP_MIN = 2; // if amp value byte-doubled
+    static constexpr int    UPSET_NB   = 8;       // evidence influence radius
     const int dirs = m_pixel / 2;
     const uint16_t* pf = u + dirs;                // plane0: range mod 6.5536
     const uint16_t* pk = u + m_pixel;              // plane1 first half: k
@@ -327,6 +335,7 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
     const uint16_t* pc = u + 2 * m_pixel;          // plane2: secondary
     const double rot = m_cfg.rotate_deg * M_PI / 180.0;
     auto dup = [](uint16_t v) { return (v & 0xFF) == (v >> 8); };
+    std::vector<unsigned char> kbadpx(dirs, 0);      // invalid-k encoding flags
 
     {
         // DEVICE RECALIBRATION BURST (~41 s after scan start, ~60 lines):
@@ -355,7 +364,7 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
         int kbad = 0;
         for (int j = 0; j < dirs; ++j) {
             long kk = lround(pk[j] / 257.0);
-            if (labs((long)pk[j] - kk * 257) > 1) ++kbad;
+            if (labs((long)pk[j] - kk * 257) > 1) { ++kbad; kbadpx[j] = 1; }
         }
         if (20 * kbad > dirs) {              // >5% broken = channel upset
             if ((m_dupLog++ % 50) == 0)
@@ -367,6 +376,24 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
         if (m_burstCool > 0) { --m_burstCool; return 0; }
     }
 
+    // near-field-overload gates: frozen-amplitude park + upset neighbourhood
+    std::vector<unsigned char> amppark(dirs, 0), nearUpset(dirs, 0);
+    for (int j = 0; j < dirs; ++j) {
+        int rep = 0;
+        for (int o = -PARKED_NB; o <= PARKED_NB; ++o) {
+            if (!o) continue;
+            if (pa[(j + o + dirs) % dirs] == pa[j]) ++rep;
+        }
+        const bool dupAmp = (pa[j] & 0xFF) == (pa[j] >> 8);
+        amppark[j] = (rep >= AMP_PARK_MIN ||
+                      (dupAmp && rep >= AMP_PARK_DUP_MIN)) ? 1 : 0;
+    }
+    for (int j = 0; j < dirs; ++j) {
+        if (!(kbadpx[j] || amppark[j])) continue;
+        for (int o = -UPSET_NB; o <= UPSET_NB; ++o)
+            nearUpset[(j + o + dirs) % dirs] = 1;
+    }
+
     // single pass: absolute range per pixel + validity
     std::vector<double> rbuf(dirs, 0.0), abuf(dirs, 0.0);
     std::vector<unsigned char> ok(dirs, 0);
@@ -374,10 +401,12 @@ long ZnF9020::decodeProfile(const unsigned char* data, size_t n, double t_s, dou
         abuf[j] = pa[j];
         if (dup(pf[j]) && pc[j] == pf[j]) continue;  // no-return status pixel
         if (abuf[j] <= m_cfg.min_amp) continue;
+        if (amppark[j]) continue;                    // frozen-amp park / scar
         double fine = pf[j] * RANGE_SCALE_M;
         long   k    = lround(pk[j] / 257.0);         // byte-doubled wrap count
         if (labs((long)pk[j] - k * 257) > 1) continue; // invalid k encoding
         if (!m_cfg.unwrap) k = 0;                     // fold display (debug)
+        if (k >= 1 && nearUpset[j]) continue;        // wrap claim in upset sector
         if (k == 0 && fine < SENTINEL_M) continue;   // window sentinel
         double r = fine + (double)k * AMBIG_M;
         if (r > R_MAX_M) continue;                   // beyond spec = junk

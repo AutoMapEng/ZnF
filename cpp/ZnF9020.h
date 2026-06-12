@@ -10,7 +10,10 @@
 // plane1[j] = ABSOLUTE WRAP COUNT k (value/257, 0..27 = full 182.68 m spec);
 // plane1[half+j] = amplitude; plane2[j] = secondary estimate used only as a
 // mixed-echo sanity check modulo its own 13.107 m interval.
-// True range r = plane0 + k*6.5536 - per-pixel absolute, no cross-line state.
+// True range r = plane0 + k*6.5536 - per-pixel absolute, no cross-line state,
+// full 182.68 m spec range. Near-field overload garbage (hand <30 cm: ghost
+// ARCS during the event, a parked SATURATION SCAR after it) is removed by
+// per-pixel gates - see decodeProfile and test_decode.py.
 // --no-unwrap ignores k and folds at 6.55 m (debug).
 //
 // The public header pulls in no socket/zlib headers - those stay in the .cpp.
