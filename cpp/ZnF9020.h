@@ -5,12 +5,13 @@
 //   * STREAM   TCP 6105, 14-byte "Z+F\0" frames; per-line zlib pixel data.
 // Each profile is one vertical-circle revolution; points are emitted as
 //   t  x  y  z  intensity   (y,z = cross-section in metres, +Y = -cos, +Z = -sin of mirror angle per Z+F manual, x = synthetic travel).
-// Line layout: pixel_/2 directions; plane0 range (live stream: ~25.7 mm
-// coarse quantisation, wraps every 6.5536 m) + plane2 secondary estimate
-// (noisy, to 13.1 m; "parks" on repeated codes where it fails to measure).
-// Nonius decode (default, cfg.unwrap): wrap count k from plane2 anchors
-// validated by local consensus, continuity chains elsewhere; --no-unwrap
-// folds at 6.55 m without using plane2.
+// Line layout: pixel_/2 directions; all live-stream values byte-doubled
+// coarse. plane0[half+j] = range modulo 6.5536 m (0.1 mm units);
+// plane1[j] = ABSOLUTE WRAP COUNT k (value/257, 0..27 = full 182.68 m spec);
+// plane1[half+j] = amplitude; plane2[j] = secondary estimate used only as a
+// mixed-echo sanity check modulo its own 13.107 m interval.
+// True range r = plane0 + k*6.5536 - per-pixel absolute, no cross-line state.
+// --no-unwrap ignores k and folds at 6.55 m (debug).
 //
 // The public header pulls in no socket/zlib headers - those stay in the .cpp.
 //
@@ -96,9 +97,8 @@ private:
     int  pixel_ = -1;
     long lines_ = 0, pts_ = 0;
     std::vector<unsigned char> payload_, inflated_, lineheader_;
-    std::vector<float> prev_r_;   // last profile's full decode, per direction
-                                  // (temporal confirmation of chained pixels)
-    int warm_n_ = 0;              // healthy profiles seen (hysteresis warmup)
+    long dup_log_ = 0;            // rate-limit dropped-line log messages
+    int  burst_cool_ = 0;         // garbled exit lines after a no-return burst
 
     ProfileCallback   on_profile_;
     std::atomic<bool> abort_{false};

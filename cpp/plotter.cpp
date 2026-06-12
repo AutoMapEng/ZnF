@@ -169,8 +169,8 @@ int main(int argc, char** argv) {
                  StructureNotifyMask | KeyPressMask | ExposureMask | ButtonPressMask);
     Atom wmDelete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, win, &wmDelete, 1);
-    XStoreName(dpy, win, pa.timed ? "AutoMap's Z+F live Y-Z - connecting ..."
-                                  : "AutoMap's Z+F live Y-Z - press Start");
+    XStoreName(dpy, win, pa.timed ? "AutoMap + GeoMetra's Z+F live Y-Z - connecting ..."
+                                  : "AutoMap + GeoMetra's Z+F live Y-Z - press Start");
     XMapWindow(dpy, win);
     GC gc = XCreateGC(dpy, win, 0, nullptr);
     XFontStruct* font = XLoadQueryFont(dpy, "fixed");   // for labels
@@ -278,14 +278,31 @@ int main(int argc, char** argv) {
             snap.assign(buf.begin(), buf.end());
         }
 
-        // autoscale: grow fast, settle slowly; square aspect
+        // autoscale: grow fast, settle slowly; square aspect. The extent is a
+        // ROBUST max (top 0.1% of points ignored) so a handful of bogus far
+        // points cannot zoom the whole room out to a dot - with the plain max
+        // a single 100 m outlier visually "corrupted" the view for seconds
+        // (ext only settles back at 0.97x per frame). Real far structures
+        // (hundreds of points and up) still set the scale.
         float m = 0.5f;
-        for (const auto& pr : snap)
-            for (size_t i = 0; i < pr.y.size(); ++i) {
-                float ay = std::fabs(pr.y[i]), az = std::fabs(pr.z[i]);
-                if (ay > m) m = ay;
-                if (az > m) m = az;
+        {
+            static unsigned hist[401];
+            memset(hist, 0, sizeof(hist));
+            size_t tot = 0;
+            for (const auto& pr : snap)
+                for (size_t i = 0; i < pr.y.size(); ++i) {
+                    float a = std::max(std::fabs(pr.y[i]), std::fabs(pr.z[i]));
+                    int b = (int)(a * 2.0f);            // 0.5 m bins to 200 m
+                    if (b > 400) b = 400;
+                    ++hist[b]; ++tot;
+                }
+            if (tot) {
+                size_t cum = 0, cut = tot / 1000;       // ignore top 0.1%
+                int b = 400;
+                for (; b > 0; --b) { cum += hist[b]; if (cum > cut) break; }
+                m = (b + 1) * 0.5f;
             }
+        }
         ext = std::max(ext * 0.97, 1.1 * (double)m);
         if (ext < 0.5) ext = 0.5;
 
@@ -422,13 +439,13 @@ int main(int argc, char** argv) {
             if (running) {
                 double tlast = snap.empty() ? 0.0 : snap.back().t;
                 snprintf(title, sizeof(title),
-                         "AutoMap's Z+F live Y-Z - %ld profiles, %ld pts - ext %.1f m - t=%.1f s",
+                         "AutoMap + GeoMetra's Z+F live Y-Z - %ld profiles, %ld pts - ext %.1f m - t=%.1f s",
                          nprof.load(), npts.load(), ext, tlast);
             } else if (sessions == 0) {
-                snprintf(title, sizeof(title), "AutoMap's Z+F live Y-Z - press Start");
+                snprintf(title, sizeof(title), "AutoMap + GeoMetra's Z+F live Y-Z - press Start");
             } else {
                 snprintf(title, sizeof(title),
-                         "AutoMap's Z+F stopped - %ld profiles, %ld pts - press Start",
+                         "AutoMap + GeoMetra's Z+F stopped - %ld profiles, %ld pts - press Start",
                          nprof.load(), npts.load());
             }
             XStoreName(dpy, win, title);

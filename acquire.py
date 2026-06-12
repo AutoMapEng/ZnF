@@ -124,218 +124,76 @@ _PREV_R = {"v": None}        # last profile's full decode (temporal confirmation
 
 
 def decode_reset():
-    """Forget temporal state (call at the start of each scan session)."""
-    _PREV_R["v"] = None
-    _PREV_R["n"] = 0
+    """Reset per-scan decoder diagnostics (burst cooldown)."""
+    _PREV_R["cool"] = 0
 
 
 def decode_dual(u, pixel, unwrap=True, prev_sec=None, min_amp=2000.0, min_range=0.0):
-    """Nonius decode (matches cpp/ZnF9020.cpp decodeProfile exactly).
-    plane0[half+j] is the range channel; the live tcpzip stream quantises it
-    to ~25.7 mm (high byte duplicated into the low byte), wrapping every
-    6.5536 m. plane2[j] (x0.2 mm, caps 13.1 m, +/-0.3 m) is an independent
-    estimate that resolves the wrap count k - but on weak/grazing returns it
-    "parks" on repeated code values instead of measuring (parked = its raw
-    value exactly repeats across neighbours; real measurements jitter).
-    k comes from plane2 where it measures (anchors, validated by local
-    k-consensus) and from continuity along the profile elsewhere (chains
-    grown from the anchors; long gaps bridged only when a run validates).
-    No-return STATUS pixels: duplicated-byte code in plane0 AND plane2 ==
-    the same raw. unwrap=False folds at 6.5536 m without using plane2.
+    """ABSOLUTE per-pixel decode (matches cpp/ZnF9020.cpp decodeProfile).
+    Live tcpzip layout, all values byte-doubled coarse (high byte duplicated):
+      plane0[half+j]  range modulo 6.5536 m (x 0.1 mm, ~25.7 mm steps)
+      plane1[j]       ABSOLUTE WRAP COUNT k (value/257; 0..27 = 182.68 m spec)
+      plane1[half+j]  amplitude
+      plane2[j]       secondary estimate (x 0.2 mm, modulo 13.107 m; "parks"
+                      on exactly-repeating codes when it fails to measure)
+    True range r = plane0 + k*6.5536 - absolute, no ambiguity, no cross-line
+    state. plane2 is used only as a mixed-echo sanity check MODULO its own
+    interval. No-return STATUS pixels: duplicated-byte code in plane0 AND
+    plane2 == the same raw value. unwrap=False ignores k (fold display).
     prev_sec accepted for API compat (unused).
     Returns (r_metres, amp, sec); invalid -> r=0."""
-    SEC_MIN_M, SEC_TOL_M = 0.40, 1.2
-    PARKED_NB, PARKED_MIN = 4, 3
-    CONS_WIN, CONS_MIN, CONS_FRAC = 16, 3, 0.6
-    GAP_STRICT, GAP_BRIDGE, BRIDGE_MIN, BRIDGE_DIV = 24, 96, 12, 4
-    BRIDGE_ENTRY_TOL = 0.70   # a bridge must CONTINUE the surface (no depth jump)
-    CHAIN_TOL_M, SLOPE_MAX = 1.5, 0.35
-    TEMPORAL_TOL = 0.40       # chained px must match the previous profile (+/-1 px)
+    SEC_MOD_M, SEC_MIN_M, SEC_VETO_M = 13.1072, 0.40, 2.5
+    PARKED_MIN = 3
+    R_MAX_M = 181.0              # spec 182.68 m (tag 50); top ~1.7 m = device
+                                 # SATURATION-SCAR band (near-field overload
+                                 # parks upset directions at max range, frozen
+                                 # amp, for the rest of the scan)
     half = pixel // 2
     fraw = u[half:pixel].astype(np.int64)
-    sraw = u[2 * pixel:2 * pixel + half].astype(np.int64)
-    fine = fraw.astype(np.float64) * RANGE_SCALE_M
+    kraw = u[pixel:pixel + half].astype(np.int64)
     amp  = u[pixel + half:2 * pixel].astype(np.float64)
+    sraw = u[2 * pixel:2 * pixel + half].astype(np.int64)
     sec  = sraw.astype(np.float64) * 2 * RANGE_SCALE_M
+    # DEVICE RECALIBRATION BURST (~41 s in, ~60 lines): plane0 collapses to
+    # one constant no-return code with ambient amplitude; drop lines whole
+    # (no real scene puts >15% of a revolution into one coarse bin).
+    modal = int(np.bincount(u[half:pixel], minlength=65536).max())
+    if 100 * modal > 15 * half:
+        _PREV_R["cool"] = 3
+        return np.zeros(half), amp, sec
+    # WRAP-COUNTER INTEGRITY: plane1[j] is byte-doubled in every healthy line
+    # ever captured. A broken k channel (device upset after near-field
+    # saturation) would scatter points to wild ranges - drop such lines whole.
+    kr = np.floor(kraw / 257.0 + 0.5)
+    kbad = np.abs(kraw - kr * 257) > 1
+    if 20 * int(kbad.sum()) > half:
+        _PREV_R["cool"] = 3
+        return np.zeros(half), amp, sec
+    if _PREV_R.get("cool", 0) > 0:
+        _PREV_R["cool"] -= 1
+        return np.zeros(half), amp, sec
     code = ((fraw & 0xFF) == (fraw >> 8)) & (sraw == fraw)   # no-return status
-    real = (~code) & (amp > min_amp)
-    if not unwrap:                            # fold at 6.55 m, no plane2 use
-        r = np.where(real & (fine >= SENTINEL_MIN_R), fine, 0.0)
-        r[r > 200.0] = 0.0
-        if min_range > 0: r[r < min_range] = 0.0
-        _PREV_R["v"] = r.astype(np.float32)   # plane0-direct: all "seeded"
-        return r, amp, sec
-    parked = np.zeros(half, dtype=np.int64)   # exact plane2 repeats (circular)
-    for off in (-4, -3, -2, -1, 1, 2, 3, 4):
-        parked += (sraw == np.roll(sraw, off))
-    secmeas = (parked < PARKED_MIN) & (sec >= SEC_MIN_M)  # plane2 measuring
-    k = np.floor((sec - fine) / AMBIG_M + 0.5)          # round-half-up = C++
-    np.clip(k, 0, 2, out=k)
-    ra = fine + k * AMBIG_M
-    anchor = (real & secmeas
-              & (np.abs(sec - ra) <= SEC_TOL_M) & ~((k == 0) & (fine < SENTINEL_MIN_R)))
-    ai = np.nonzero(anchor)[0]
-    r = np.zeros(half)
-    seeded = np.zeros(half, bool)
-    ak = k[ai].astype(np.int64)
-    lo = np.searchsorted(ai, ai - CONS_WIN); hi = np.searchsorted(ai, ai + CONS_WIN + 1)
-    prev0_d = _PREV_R["v"] if _PREV_R.get("n", 0) >= 8 else None
-    if prev0_d is not None and prev0_d.shape != (half,): prev0_d = None
-    for t in range(len(ai)):                  # consensus: lone anchors don't seed
-        votes = ak[lo[t]:hi[t]]
-        if len(votes) >= CONS_MIN and (votes == ak[t]).mean() >= CONS_FRAC:
-            jj = ai[t]
-            # wrap-trap demotion: a k=0 seed (plane2 ~ plane0 carries no wrap
-            # info) on a direction already locked at k>=1 yields to the lock.
-            if ak[t] == 0 and prev0_d is not None and prev0_d[jj] > 0:
-                # exact-j only: reading NEIGHBOUR locks here lets a k>=1
-                # region alias-creep over adjacent true-k0 seeds (ratchet)
-                kp = math.floor((float(prev0_d[jj]) - fine[jj]) / AMBIG_M + 0.5)
-                if 1 <= kp <= 2 and abs(fine[jj] + kp * AMBIG_M
-                                        - float(prev0_d[jj])) <= TEMPORAL_TOL:
-                    continue
-            r[jj] = ra[jj]; seeded[jj] = True
-
-    def secveto(j, cand):
-        # plane2 MEASURES yet matches NO wrap alias of plane0: mixed pixel
-        # (plane2 locked a different echo) - paint at no k. Matching some
-        # alias merely cannot RESOLVE k (plane2 may wrap like plane0).
-        if not secmeas[j]:
-            return False
-        d = min(abs(sec[j] - fine[j] - kq * AMBIG_M) for kq in (0, 1, 2))
-        return d > 2.5
-
-    # previous-profile k hysteresis: an established wrap count sticks across
-    # profiles - an alias slide (folded surface numerically continuing a
-    # closer one) cannot re-claim a sector once the true k was painted.
-    prevpass = np.zeros(half, bool)
-    prev0 = _PREV_R["v"]
-    if prev0 is not None and prev0.shape == r.shape and _PREV_R.get("n", 0) >= 8:
-        for jj in np.nonzero(real & (r == 0) & (prev0 > 0))[0]:
-            kp = math.floor((float(prev0[jj]) - fine[jj]) / AMBIG_M + 0.5)
-            if kp < 1 or kp > 2: continue      # never lock k=0: the fold alias
-                                               # is k=0 by construction; close
-                                               # content re-anchors every profile
-            cand = fine[jj] + kp * AMBIG_M
-            if abs(cand - float(prev0[jj])) > TEMPORAL_TOL: continue
-            if kp == 0 and fine[jj] < SENTINEL_MIN_R: continue
-            if secveto(jj, cand): continue
-            r[jj] = cand; prevpass[jj] = True      # chained (not seeded)
-    for sweep in (range(half), range(half - 1, -1, -1)):   # continuity chains
-        pend = []                              # (j, cand, fraw, is_anchor)
-        last_j = -(1 << 30); last_r = 0.0; prev_j = -(1 << 30); prev_r = 0.0
-        bridging = False
-        # fold-crossing credential: only a chain that has ITSELF stepped k by
-        # +/-1 across a tight gap (the genuine wrap-crossing signature) may
-        # re-key seeded pixels; captures never earn it (anti-ratchet).
-        cred = False; last_k = 0
-        for i in sweep:
-            if r[i] > 0.0:
-                # chain-context override: plane2's wrap ambiguity can seed k=0
-                # on FOLDED content (it wraps like plane0: sec 0.93 ~ fine 0.90
-                # for a surface truly at 7.45 m). A live chain carrying the
-                # true surface bumps such a pixel one wrap up when k+1 fits it
-                # tightly and the k=0 reading does not.
-                # A pixel CONFLICTING with the live chain that cannot be
-                # re-keyed is transparent: it must not capture the chain.
-                ovr = (cred and ((seeded[i] and k[i] == 0) or prevpass[i])
-                       and r[i] - fine[i] < 0.5 * AMBIG_M)
-                if ovr and last_j > -(1 << 29) and abs(i - last_j) <= GAP_STRICT:
-                    gap0 = abs(i - last_j)
-                    slope0 = 0.0
-                    dj0 = last_j - prev_j
-                    if dj0 != 0 and abs(dj0) <= 4:
-                        slope0 = max(-SLOPE_MAX, min(SLOPE_MAX, (last_r - prev_r) / dj0))
-                    pred0 = last_r + slope0 * (i - last_j)
-                    tol0 = min(0.25 + 0.05 * gap0, CHAIN_TOL_M)
-                    up = r[i] + AMBIG_M
-                    if (abs(up - pred0) <= tol0 and abs(r[i] - pred0) > tol0
-                            and not secveto(i, up)):
-                        r[i] = up                      # re-keyed one wrap up
-                        seeded[i] = False; prevpass[i] = False
-                    elif abs(r[i] - pred0) > tol0:
-                        continue                       # conflicting: transparent
-                if bridging: pend = []; bridging = False
-                last_k = int(min(2, max(0, math.floor((r[i] - fine[i]) / AMBIG_M + 0.5))))
-                prev_j, prev_r = last_j, last_r; last_j, last_r = i, r[i]
-                continue                           # captures never grant cred
-            if not real[i]: continue
-            gap = abs(i - last_j)
-            if gap > GAP_BRIDGE: continue
-            slope = 0.0
-            dj = last_j - prev_j
-            if dj != 0 and abs(dj) <= 4:
-                slope = max(-SLOPE_MAX, min(SLOPE_MAX, (last_r - prev_r) / dj))
-            pred = last_r + slope * (i - last_j)
-            kk = min(2.0, max(0.0, math.floor((pred - fine[i]) / AMBIG_M + 0.5)))
-            cand = fine[i] + kk * AMBIG_M
-            tol = min(0.25 + 0.05 * gap, CHAIN_TOL_M)
-            if (abs(cand - pred) <= tol and not (kk == 0 and fine[i] < SENTINEL_MIN_R)
-                    and not secveto(i, cand)):
-                if gap > GAP_STRICT and not bridging:
-                    if abs(cand - pred) > BRIDGE_ENTRY_TOL: continue
-                    bridging = True; pend = [(i, cand, fraw[i], bool(anchor[i]))]
-                elif bridging:
-                    pend.append((i, cand, fraw[i], bool(anchor[i])))
-                    if len(pend) >= BRIDGE_MIN:
-                        if (len(set(p[2] for p in pend)) >= BRIDGE_DIV
-                                or any(p[3] for p in pend)):
-                            for q, rv, _, _ in pend: r[q] = rv
-                            pend = []; bridging = False
-                else:
-                    r[i] = cand
-                if gap <= 8 and last_j > -(1 << 29) and abs(int(kk) - last_k) == 1:
-                    cred = True                # genuine fold crossing
-                last_k = int(kk)
-                prev_j, prev_r = last_j, last_r; last_j, last_r = i, cand
-            elif bridging:
-                pend = []; bridging = False
-                last_j = -(1 << 30); cred = False  # restart from next seed
-    r[r > 200.0] = 0.0                         # spec max range guard
-    if min_range > 0: r[r < min_range] = 0.0
-    # temporal confirmation: a CHAINED pixel (no plane2 verification) is only
-    # emitted once the previous profile agrees at the same direction (+/-1 px).
-    # One-profile warmup for new structures; kills per-profile k-flicker.
-    full = r.astype(np.float32)
-    prev = _PREV_R["v"]
-    chained = (r > 0) & ~seeded
-    if prev is not None and prev.shape == r.shape:
-        conf = np.zeros(half, bool)
-        for o in (-1, 0, 1):
-            sh = np.zeros(half, np.float32)
-            if o == 0:    sh[:]   = prev
-            elif o == -1: sh[1:]  = prev[:-1]
-            else:         sh[:-1] = prev[1:]
-            conf |= (sh > 0) & (np.abs(sh.astype(np.float64) - r) <= TEMPORAL_TOL)
-        r = np.where(chained & ~conf, 0.0, r)
-    else:
-        r = np.where(chained, 0.0, r)
-    # fold-corner fuzz: a plane2-seeded k=0 pixel whose NEIGHBOUR direction is
-    # locked at k>=1 consistent with this pixel's fine is wrap-ambiguous -
-    # suppress its EMISSION only (the state keeps the full decode: no feedback,
-    # so unlike seed demotion at +/-1 this cannot alias-creep).
-    if prev0_d is not None:
-        sk0 = seeded & (k == 0) & (r > 0)
-        if np.any(sk0):
-            amb = np.zeros(half, bool)
-            for o in (-1, 0, 1):
-                sh = np.zeros(half, np.float32)
-                if o == 0:    sh[:]   = prev0_d
-                elif o == -1: sh[1:]  = prev0_d[:-1]
-                else:         sh[:-1] = prev0_d[1:]
-                kp = np.floor((sh.astype(np.float64) - fine) / AMBIG_M + 0.5)
-                amb |= ((sh > 0) & (kp >= 1) & (kp <= 2)
-                        & (np.abs(fine + kp * AMBIG_M - sh.astype(np.float64))
-                           <= TEMPORAL_TOL))
-            r = np.where(sk0 & amb, 0.0, r)
-    # spin-up/transition junk (plane2 globally dead: laser on but anchors a
-    # tiny FRACTION of real pixels - healthy lines run ~25-60%) must not
-    # poison the temporal state; otherwise remember the FULL decode
-    # (pre-suppression) so new stable structures confirm on the next profile
-    if len(ai) >= 16 and 10 * len(ai) >= int(real.sum()):
-        _PREV_R["v"] = full
-        _PREV_R["n"] = _PREV_R.get("n", 0) + 1   # hysteresis after 8 healthy
-    return r, amp, sec
+    fine = fraw.astype(np.float64) * RANGE_SCALE_M
+    k = kr                                           # byte-doubled wrap count
+    if not unwrap:
+        k = np.zeros_like(k)
+    r = fine + k * AMBIG_M
+    ok = ((~code) & (~kbad) & (amp > min_amp)
+          & ~((k == 0) & (fine < SENTINEL_MIN_R))    # window sentinel
+          & (r <= R_MAX_M) & (r >= min_range))
+    if unwrap:
+        # plane2 sanity: when it MEASURES (parked codes exactly repeat across
+        # neighbours; real values jitter), it must agree with r modulo its
+        # own interval, else the pixel is a mixed echo
+        parked = np.zeros(half, dtype=np.int64)
+        for off in (-4, -3, -2, -1, 1, 2, 3, 4):
+            parked += (sraw == np.roll(sraw, off))
+        secm = (sec >= SEC_MIN_M) & (parked < PARKED_MIN)
+        m = np.mod(r, SEC_MOD_M)
+        d = np.abs(sec - m)
+        d = np.minimum(d, SEC_MOD_M - d)
+        ok &= ~(secm & (d > SEC_VETO_M))
+    return np.where(ok, r, 0.0), amp, sec
 
 
 def parse_zfs_header_pixel(buf):
@@ -456,14 +314,29 @@ def recv_exact(sock, n):
 
 
 def read_frame(sock):
-    """Resync to the 'Z+F\0' marker, read the 14-byte header + payload."""
-    window = recv_exact(sock, 4)
-    while window != MARKER:
-        window = window[1:] + recv_exact(sock, 1)
-    hdr = recv_exact(sock, 10)
-    ptype, size, elems = struct.unpack("<HII", hdr)
-    payload = recv_exact(sock, size) if size else b""
-    return ptype, elems, payload
+    """Resync to the 'Z+F\0' marker, read the 14-byte header + payload.
+    Hardened: an implausible size field (device-side desync, or a false
+    marker inside pixel data) is rejected and scanning resumes at the next
+    marker - a naive read would swallow SECONDS of stream as one bogus
+    payload (seen live as a spontaneous multi-second outage)."""
+    MAX_FRAME_BYTES = 4 << 20            # legit frames are < ~1 MiB
+    while True:
+        window = recv_exact(sock, 4)
+        skipped = 0
+        while window != MARKER:
+            window = window[1:] + recv_exact(sock, 1)
+            skipped += 1
+        if skipped:
+            print(f"# stream resync: {skipped} bytes skipped to next frame marker",
+                  file=sys.stderr)
+        hdr = recv_exact(sock, 10)
+        ptype, size, elems = struct.unpack("<HII", hdr)
+        if size > MAX_FRAME_BYTES:
+            print(f"# stream desync: implausible frame size {size} (type {ptype})"
+                  " - resyncing", file=sys.stderr)
+            continue
+        payload = recv_exact(sock, size) if size else b""
+        return ptype, elems, payload
 
 
 def send_cmd(cmd_sock, text, wait=2.5):
